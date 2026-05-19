@@ -58,11 +58,11 @@ class ValidityFirstPlacer:
         selected = _select_by_fast_score(candidates, benchmark, selector_data, eps=self.selector_eps)
         if _env_bool("OURS_BATCH_ANALYTICAL", "0"):
             selected = _try_batch_analytical_refine(selected, benchmark)
-        if _env_bool("OURS_ANALYTICAL", "0"):
+        if _env_bool("OURS_ANALYTICAL", "1"):
             selected = _try_analytical_refine(selected, benchmark)
-        if _env_bool("OURS_SOFT_SEARCH", "0"):
+        if _env_bool("OURS_SOFT_SEARCH", "1"):
             selected = _try_soft_search_refine(selected, benchmark)
-        if _env_bool("OURS_SNAP_SEARCH", "0"):
+        if _env_bool("OURS_SNAP_SEARCH", "1"):
             selected = _try_snap_search_refine(selected, benchmark)
         if _env_bool("OURS_FAST_SEARCH", "0"):
             selected = _try_fast_search_refine(selected, benchmark)
