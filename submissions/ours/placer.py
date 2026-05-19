@@ -30,7 +30,7 @@ class ValidityFirstPlacer:
         self.optimize = _env_bool("OURS_OPT", "1")
         self.steps = _env_int("OURS_STEPS", 40)
         self.exact_select = _env_bool("OURS_EXACT_SELECT", "0")
-        self.local_passes = _env_int("OURS_LOCAL_PASSES", 1)
+        self.local_passes = _env_int("OURS_LOCAL_PASSES", 0)
         self.layout_candidates = _env_int("OURS_LAYOUT_CANDIDATES", 0)
         self.max_candidates = _env_int("OURS_MAX_CANDIDATES", 4)
         self.pin_candidates = _env_int("OURS_PIN_CANDIDATES", 0)
