@@ -103,9 +103,9 @@ def refine_with_replace(
         return baseline
 
     configs = _configs()
-    timeout = _env_float("OURS_REPLACE_TIMEOUT", 180.0)
-    stop_after_first = _env_bool("OURS_REPLACE_STOP_AFTER_FIRST", "1")
-    max_candidates = _env_int("OURS_REPLACE_MAX_CANDIDATES", 4)
+    timeout = _env_float("OURS_REPLACE_TIMEOUT", 900.0)
+    stop_after_first = _env_bool("OURS_REPLACE_STOP_AFTER_FIRST", "0")
+    max_candidates = _env_int("OURS_REPLACE_MAX_CANDIDATES", 16)
     tried = 0
 
     for config in configs:
@@ -161,14 +161,24 @@ def _configs() -> list[_Config]:
             parts = [part.strip() for part in spec.split(",") if part.strip()]
             if len(parts) < 2:
                 continue
-            extra = tuple(parts[2:])
-            out.append(_Config(float(parts[0]), float(parts[1]), extra))
+            try:
+                extra = tuple(parts[2:])
+                out.append(_Config(float(parts[0]), float(parts[1]), extra))
+            except ValueError:
+                continue
         if out:
             return out
     return [
+        _Config(0.70, 1.03, ("-bin", "64")),
         _Config(0.72, 1.03),
+        _Config(0.72, 1.03, ("-bin", "64")),
+        _Config(0.72, 1.03, ("-bin", "128")),
+        _Config(0.78, 1.03),
         _Config(0.80, 1.03),
         _Config(0.80, 1.03, ("-bin", "64")),
+        _Config(0.80, 1.03, ("-bin", "128")),
+        _Config(0.80, 1.20, ("-bin", "64")),
+        _Config(0.84, 1.03, ("-bin", "64")),
     ]
 
 
