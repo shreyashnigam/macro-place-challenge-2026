@@ -230,6 +230,70 @@ def _print_table(results: list[dict], summary: dict) -> None:
     )
 
 
+def _metadata(
+    *,
+    args: argparse.Namespace,
+    placer,
+    placer_path: Path,
+    benchmarks: list[str],
+    timestamp: str,
+    started: float,
+    env: dict[str, str],
+    summary: dict,
+    partial: bool,
+) -> dict:
+    return {
+        "label": args.label,
+        "placer": str(placer_path),
+        "placer_class": type(placer).__name__,
+        "benchmarks": benchmarks,
+        "created_at": timestamp,
+        "wall_runtime": time.time() - started,
+        "python": platform.python_version(),
+        "platform": platform.platform(),
+        "env": env,
+        "candidate_mode": args.candidates,
+        "partial": partial,
+        "summary": summary,
+    }
+
+
+def _write_run_record(
+    run_dir: Path,
+    *,
+    metadata: dict,
+    results: list[dict],
+    candidate_rows: list[dict],
+) -> None:
+    _write_csv(run_dir / "results.csv", results)
+    if metadata.get("candidate_mode"):
+        _write_candidate_csv(run_dir / "candidates.csv", candidate_rows)
+    with (run_dir / "results.json").open("w") as f:
+        json.dump(
+            _json_safe(
+                {
+                    "metadata": metadata,
+                    "results": results,
+                    "candidates": candidate_rows if metadata.get("candidate_mode") else [],
+                }
+            ),
+            f,
+            indent=2,
+        )
+
+
+def _print_result_line(result: dict) -> None:
+    print(
+        f"{result['name']}: proxy={float(result['proxy_cost']):.4f} "
+        f"wl={float(result['wirelength']):.3f} "
+        f"den={float(result['density']):.3f} "
+        f"cong={float(result['congestion']):.3f} "
+        f"ov={int(result['overlaps'])} "
+        f"rt={float(result['runtime']):.2f}s",
+        flush=True,
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Record a macro-placement experiment run.")
     parser.add_argument("placer", help="Path to a placer .py file.")
@@ -281,37 +345,45 @@ def main() -> None:
             result.pop("benchmark", None)
             result.pop("plc", None)
         results.append(result)
+        _print_result_line(result)
+
+        partial_summary = _summarize(results, args.target)
+        partial_metadata = _metadata(
+            args=args,
+            placer=placer,
+            placer_path=placer_path,
+            benchmarks=benchmarks,
+            timestamp=timestamp,
+            started=started,
+            env=env,
+            summary=partial_summary,
+            partial=len(results) < len(benchmarks),
+        )
+        _write_run_record(
+            run_dir,
+            metadata=partial_metadata,
+            results=results,
+            candidate_rows=candidate_rows,
+        )
 
     summary = _summarize(results, args.target)
-    metadata = {
-        "label": args.label,
-        "placer": str(placer_path),
-        "placer_class": type(placer).__name__,
-        "benchmarks": benchmarks,
-        "created_at": timestamp,
-        "wall_runtime": time.time() - started,
-        "python": platform.python_version(),
-        "platform": platform.platform(),
-        "env": env,
-        "candidate_mode": args.candidates,
-        "summary": summary,
-    }
-
-    _write_csv(run_dir / "results.csv", results)
-    if args.candidates:
-        _write_candidate_csv(run_dir / "candidates.csv", candidate_rows)
-    with (run_dir / "results.json").open("w") as f:
-        json.dump(
-            _json_safe(
-                {
-                    "metadata": metadata,
-                    "results": results,
-                    "candidates": candidate_rows if args.candidates else [],
-                }
-            ),
-            f,
-            indent=2,
-        )
+    metadata = _metadata(
+        args=args,
+        placer=placer,
+        placer_path=placer_path,
+        benchmarks=benchmarks,
+        timestamp=timestamp,
+        started=started,
+        env=env,
+        summary=summary,
+        partial=False,
+    )
+    _write_run_record(
+        run_dir,
+        metadata=metadata,
+        results=results,
+        candidate_rows=candidate_rows,
+    )
 
     _print_table(results, summary)
     print(f"\nrecorded: {run_dir}")
