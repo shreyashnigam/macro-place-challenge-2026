@@ -782,6 +782,26 @@ def _select_by_fast_score(
     ]
     best_score = min(score for score, _, _, _ in scored)
     near_best = [item for item in scored if item[0] <= best_score + eps]
+    best_item = min(scored, key=lambda item: item[0])
+
+    mirror_identity = next((item for item in scored if item[2] == "mirror:identity"), None)
+    if mirror_identity is not None:
+        if (
+            best_item[2].endswith(":route_cong")
+            and mirror_identity[0] <= best_score + _env_float("OURS_MIRROR_KEEP_EPS", 0.015)
+        ):
+            return mirror_identity[3]
+
+        first_legal_balanced = [
+            item for item in scored if item[2] == "opt:first_legal:classic_balanced"
+        ]
+        if (
+            best_item[2] == "mirror:identity"
+            and first_legal_balanced
+            and min(first_legal_balanced, key=lambda item: item[0])[0]
+            <= best_score + _env_float("OURS_FIRST_LEGAL_BALANCED_EPS", 0.005)
+        ):
+            return min(first_legal_balanced, key=lambda item: item[0])[3]
 
     balanced_eps = _env_float("OURS_BALANCED_SELECTOR_EPS", 0.00125)
     balanced_near = [
