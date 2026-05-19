@@ -21,6 +21,9 @@ jobs:
   replace-smoke:
     runs-on: ubuntu-22.04
     timeout-minutes: 90
+    env:
+      BENCHMARK: ${{ github.event.inputs.benchmark || 'ibm01' }}
+      REPLACE_TIMEOUT_SECONDS: ${{ github.event.inputs.timeout_seconds || '90' }}
 
     steps:
       - name: Checkout
@@ -37,13 +40,13 @@ jobs:
       - name: Run RePlAce smoke
         env:
           OURS_REPLACE: "1"
-          OURS_REPLACE_TIMEOUT: ${{ inputs.timeout_seconds }}
+          OURS_REPLACE_TIMEOUT: ${{ env.REPLACE_TIMEOUT_SECONDS }}
           OURS_REPLACE_MAX_CANDIDATES: "1"
           OURS_REPLACE_CONFIGS: "0.72,1.03"
         run: |
           uv run python scripts/run_experiment.py submissions/ours/placer.py \
-            --benchmark "${{ inputs.benchmark }}" \
-            --label "gha_replace_smoke_${{ inputs.benchmark }}"
+            --benchmark "${{ env.BENCHMARK }}" \
+            --label "gha_replace_smoke_${{ env.BENCHMARK }}"
 
       - name: Upload experiment records
         uses: actions/upload-artifact@v4
