@@ -87,6 +87,12 @@ def refine_with_replace(
     work_root = Path(os.environ.get("OURS_REPLACE_WORKDIR", tempfile.gettempdir()))
     run_root = work_root / "macro_place_ours_replace" / _safe_name(str(benchmark.name)) / str(os.getpid())
     bs_name = _safe_name(str(benchmark.name))
+    start_mode = os.environ.get("OURS_REPLACE_START", "selected").strip().lower()
+    if start_mode in {"initial", "original"}:
+        replace_start = benchmark.macro_positions.detach().clone().float()
+    else:
+        start_mode = "selected"
+        replace_start = best
 
     try:
         export = _write_bookshelf(
@@ -95,9 +101,9 @@ def refine_with_replace(
             run_root / "ETC" / bs_name,
             bs_name=bs_name,
             scale=_env_int("OURS_REPLACE_SCALE", 1000),
-            initial_placement=best,
+            initial_placement=replace_start,
         )
-        _debug(f"exported Bookshelf to {export.directory}")
+        _debug(f"exported Bookshelf to {export.directory} start={start_mode}")
     except Exception:
         _debug("Bookshelf export failed")
         return baseline
@@ -350,7 +356,10 @@ def _run_replace(
     cmd = [str(binary), "-bmflag", "etc", "-bmname", export.name, *config.args()]
     log_dir = cwd / "replace_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    log_path = log_dir / f"{export.name}_{_fmt(config.density)}_{_fmt(config.pcofmax)}.log"
+    log_suffix = "_".join(_safe_name(arg.lstrip("-")) for arg in config.extra_args)
+    if log_suffix:
+        log_suffix = f"_{log_suffix}"
+    log_path = log_dir / f"{export.name}_{_fmt(config.density)}_{_fmt(config.pcofmax)}{log_suffix}.log"
     started = time.monotonic()
     with log_path.open("w", encoding="utf-8", errors="replace") as log:
         proc = subprocess.Popen(cmd, cwd=str(cwd), stdout=log, stderr=subprocess.STDOUT, text=True)
