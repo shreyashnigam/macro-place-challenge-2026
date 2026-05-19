@@ -101,10 +101,10 @@ for bench in "${BENCHMARKS[@]}"; do
 
     result_line="$(grep -E "proxy=.*\\[[0-9.]+s\\]" "$bench_log" | tail -1 || true)"
     proxy="$(sed -nE 's/.*proxy=([0-9.]+).*/\1/p' <<< "$result_line")"
-    runtime="$(sed -nE 's/.*\\[([0-9.]+)s\\].*/\1/p' <<< "$result_line")"
+    runtime="$(sed -nE 's/.*\[([0-9.]+)s\].*/\1/p' <<< "$result_line")"
     overlaps="0"
     if grep -q "INVALID" <<< "$result_line"; then
-        overlaps="$(sed -nE 's/.*INVALID \\(([0-9]+) overlaps\\).*/\1/p' <<< "$result_line")"
+        overlaps="$(sed -nE 's/.*INVALID \(([0-9]+) overlaps\).*/\1/p' <<< "$result_line")"
     fi
     printf "%s\tok\t%s\t%s\t%s\n" "$bench" "$proxy" "$overlaps" "$runtime" | tee -a "$SUMMARY"
 done
