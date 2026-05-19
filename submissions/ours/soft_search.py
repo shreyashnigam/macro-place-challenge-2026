@@ -70,7 +70,47 @@ def refine_with_soft_search(
     node_nets, nets = _build_node_nets(benchmark)
     total_trials = 0
     accepted = 0
+    exact_guard = _env_bool("OURS_SOFT_SEARCH_EXACT_GUARD", "1")
+    exact_stride = max(0, _env_int("OURS_SOFT_SEARCH_EXACT_STRIDE", 0))
+    base_exact_cost: float | None = None
+    best_exact_cost: float | None = None
+    best_exact: torch.Tensor | None = None
+    last_exact_accept = 0
     diag = float(np.hypot(float(benchmark.canvas_width), float(benchmark.canvas_height)))
+
+    if exact_guard:
+        try:
+            base_exact = compute_proxy_cost(baseline.detach().float(), benchmark, plc)
+        except Exception:
+            return baseline
+        if int(base_exact.get("overlap_count", 1)) != 0:
+            return baseline
+        base_exact_cost = float(base_exact["proxy_cost"])
+        best_exact_cost = base_exact_cost
+        best_exact = baseline.detach().clone().float()
+
+    def checkpoint_exact(label: str) -> None:
+        nonlocal best_exact_cost, best_exact, last_exact_accept
+        if not exact_guard:
+            return
+        candidate = torch.tensor(current, dtype=baseline.dtype)
+        if not is_valid(candidate, benchmark):
+            return
+        try:
+            cand_exact = compute_proxy_cost(candidate.detach().float(), benchmark, plc)
+        except Exception:
+            return
+        if int(cand_exact.get("overlap_count", 1)) != 0:
+            return
+        cand_cost = float(cand_exact["proxy_cost"])
+        if best_exact_cost is None or cand_cost < best_exact_cost - eps:
+            best_exact_cost = cand_cost
+            best_exact = candidate.detach().clone().float()
+            _debug(
+                f"checkpoint {label} exact={cand_cost:.6f} "
+                f"fast={best_fast:.6f} accepted={accepted} trials={total_trials}"
+            )
+        last_exact_accept = accepted
 
     for round_idx in range(rounds):
         try:
@@ -113,6 +153,8 @@ def refine_with_soft_search(
                     best_fast = cost
                     accepted += 1
                     round_improved = True
+                    if exact_stride > 0 and accepted - last_exact_accept >= exact_stride:
+                        checkpoint_exact(f"accepted:{accepted}")
 
             if total_trials >= max_trials:
                 break
@@ -121,6 +163,8 @@ def refine_with_soft_search(
             f"round={round_idx} fast={best_fast:.6f} "
             f"accepted={accepted} trials={total_trials}"
         )
+        if round_improved:
+            checkpoint_exact(f"round:{round_idx}")
         if not round_improved or total_trials >= max_trials:
             break
 
@@ -129,33 +173,36 @@ def refine_with_soft_search(
 
     candidate = torch.tensor(current, dtype=baseline.dtype)
     if not is_valid(candidate, benchmark):
+        if exact_guard and best_exact is not None and best_exact_cost is not None:
+            if base_exact_cost is not None and best_exact_cost < base_exact_cost - eps:
+                return best_exact.detach().clone().float()
         return baseline
 
-    if not _env_bool("OURS_SOFT_SEARCH_EXACT_GUARD", "1"):
+    if not exact_guard:
         _debug(
             f"accepted without exact guard fast={best_fast:.6f} "
             f"accepted={accepted} trials={total_trials}"
         )
         return candidate.detach().clone().float()
 
-    try:
-        base_exact = compute_proxy_cost(baseline.detach().float(), benchmark, plc)
-        cand_exact = compute_proxy_cost(candidate.detach().float(), benchmark, plc)
-    except Exception:
-        return baseline
-    if int(cand_exact.get("overlap_count", 1)) != 0:
-        return baseline
-    if float(cand_exact["proxy_cost"]) < float(base_exact["proxy_cost"]) - eps:
+    checkpoint_exact("final")
+    if (
+        best_exact is not None
+        and best_exact_cost is not None
+        and base_exact_cost is not None
+        and best_exact_cost < base_exact_cost - eps
+    ):
         _debug(
             "accepted exact "
-            f"{float(base_exact['proxy_cost']):.6f}->{float(cand_exact['proxy_cost']):.6f} "
+            f"{base_exact_cost:.6f}->{best_exact_cost:.6f} "
             f"fast={best_fast:.6f} accepted={accepted} trials={total_trials}"
         )
-        return candidate.detach().clone().float()
+        return best_exact.detach().clone().float()
 
+    final_exact = best_exact_cost if best_exact_cost is not None else base_exact_cost
     _debug(
         "rejected exact "
-        f"{float(base_exact['proxy_cost']):.6f}->{float(cand_exact['proxy_cost']):.6f} "
+        f"{base_exact_cost:.6f}->{final_exact:.6f} "
         f"fast={best_fast:.6f} accepted={accepted} trials={total_trials}"
     )
     return baseline
