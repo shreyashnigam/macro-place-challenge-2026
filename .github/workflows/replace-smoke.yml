@@ -43,6 +43,8 @@ jobs:
           OURS_REPLACE_TIMEOUT: ${{ env.REPLACE_TIMEOUT_SECONDS }}
           OURS_REPLACE_MAX_CANDIDATES: "1"
           OURS_REPLACE_CONFIGS: "0.72,1.03"
+          OURS_REPLACE_DEBUG: "1"
+          OURS_REPLACE_WORKDIR: "replace_work"
         run: |
           uv run python scripts/run_experiment.py submissions/ours/placer.py \
             --benchmark "${{ env.BENCHMARK }}" \
@@ -53,4 +55,6 @@ jobs:
         if: always()
         with:
           name: replace-smoke-experiments
-          path: experiments/
+          path: |
+            experiments/
+            replace_work/

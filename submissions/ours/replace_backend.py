@@ -63,6 +63,7 @@ def refine_with_replace(
 
     plc = load_plc(benchmark)
     if plc is None:
+        _debug("no plc found")
         return baseline
 
     binary = Path(os.environ.get(
@@ -72,12 +73,15 @@ def refine_with_replace(
     if not binary.is_absolute():
         binary = (Path.cwd() / binary).resolve()
     if not binary.exists():
+        _debug(f"binary not found: {binary}")
         return baseline
 
     try:
         best = baseline.detach().clone().float()
         best_cost = float(compute_proxy_cost(best, benchmark, plc)["proxy_cost"])
+        _debug(f"baseline proxy={best_cost:.6f}")
     except Exception:
+        _debug("could not score baseline")
         return baseline
 
     work_root = Path(os.environ.get("OURS_REPLACE_WORKDIR", tempfile.gettempdir()))
@@ -93,7 +97,9 @@ def refine_with_replace(
             scale=_env_int("OURS_REPLACE_SCALE", 1000),
             initial_placement=best,
         )
+        _debug(f"exported Bookshelf to {export.directory}")
     except Exception:
+        _debug("Bookshelf export failed")
         return baseline
 
     configs = _configs()
@@ -106,6 +112,7 @@ def refine_with_replace(
         if tried >= max_candidates:
             break
         try:
+            _debug(f"running RePlAce den={config.density} pcofmax={config.pcofmax} extra={config.extra_args}")
             pl_paths = _run_replace(
                 export,
                 config,
@@ -113,7 +120,9 @@ def refine_with_replace(
                 timeout=timeout,
                 stop_after_first=stop_after_first,
             )
+            _debug(f"RePlAce produced {len(pl_paths)} placement files")
         except Exception:
+            _debug("RePlAce execution failed")
             continue
 
         for pl_path in pl_paths:
@@ -129,13 +138,17 @@ def refine_with_replace(
                     max_rounds=_env_int("OURS_REPLACE_LEGALIZE_ROUNDS", 800),
                 )
                 if not is_valid(candidate, benchmark):
+                    _debug(f"candidate invalid: {pl_path}")
                     continue
                 cost = float(compute_proxy_cost(candidate, benchmark, plc)["proxy_cost"])
             except Exception:
+                _debug(f"candidate import/score failed: {pl_path}")
                 continue
+            _debug(f"candidate proxy={cost:.6f}: {pl_path}")
             if cost < best_cost:
                 best = candidate.detach().clone().float()
                 best_cost = cost
+                _debug(f"accepted new best proxy={best_cost:.6f}")
 
     return best
 
@@ -348,7 +361,9 @@ def _run_replace(
         proc.wait()
 
     new_dirs = [path for path in _experiment_dirs(cwd, export.name) if path not in before]
-    return _pl_paths(new_dirs, export.name)
+    pl_paths = _pl_paths(new_dirs, export.name)
+    _debug(f"returncode={proc.returncode} log={log_path} new_dirs={len(new_dirs)} pl_paths={len(pl_paths)}")
+    return pl_paths
 
 
 def _import_bookshelf(pl_path: Path, metadata_path: Path, benchmark: Benchmark) -> torch.Tensor:
@@ -557,6 +572,11 @@ def _safe_name(name: str) -> str:
 
 def _fmt(value: float) -> str:
     return f"{float(value):.6g}"
+
+
+def _debug(message: str) -> None:
+    if os.environ.get("OURS_REPLACE_DEBUG", "").strip():
+        print(f"[OURS_REPLACE] {message}", flush=True)
 
 
 def _env_bool(name: str, default: str) -> bool:
