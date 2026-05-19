@@ -58,6 +58,8 @@ class ValidityFirstPlacer:
         selected = _select_by_fast_score(candidates, benchmark, selector_data, eps=self.selector_eps)
         if _env_bool("OURS_ANALYTICAL", "0"):
             selected = _try_analytical_refine(selected, benchmark)
+        if _env_bool("OURS_FAST_SEARCH", "0"):
+            selected = _try_fast_search_refine(selected, benchmark)
         if _env_bool("OURS_REPLACE", "0"):
             selected = _try_replace_refine(selected, benchmark)
         return selected
@@ -1015,6 +1017,26 @@ def _try_analytical_refine(placement: torch.Tensor, benchmark: Benchmark) -> tor
             benchmark,
             load_plc=_load_plc,
             legalize_hard=_legalize_hard,
+            is_valid=_is_strictly_valid,
+        )
+    except Exception:
+        return placement
+
+
+def _try_fast_search_refine(placement: torch.Tensor, benchmark: Benchmark) -> torch.Tensor:
+    try:
+        helper_dir = Path(__file__).resolve().parent
+        if str(helper_dir) not in sys.path:
+            sys.path.insert(0, str(helper_dir))
+        from fast_search import refine_with_fast_search
+    except Exception:
+        return placement
+
+    try:
+        return refine_with_fast_search(
+            placement,
+            benchmark,
+            load_plc=_load_plc,
             is_valid=_is_strictly_valid,
         )
     except Exception:
