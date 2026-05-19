@@ -45,12 +45,12 @@ def refine_with_fast_search(
     except Exception:
         return baseline
 
-    rounds = _env_int("OURS_FAST_SEARCH_ROUNDS", 2)
+    rounds = _env_int("OURS_FAST_SEARCH_ROUNDS", 3)
     if rounds <= 0:
         return baseline
 
-    macro_count = _env_int("OURS_FAST_SEARCH_MACROS", 10)
-    max_trials = _env_int("OURS_FAST_SEARCH_TRIALS", 96)
+    macro_count = _env_int("OURS_FAST_SEARCH_MACROS", 16)
+    max_trials = _env_int("OURS_FAST_SEARCH_TRIALS", 256)
     eps = _env_float("OURS_FAST_SEARCH_EPS", 1e-5)
     gap = _env_float("OURS_FAST_SEARCH_GAP", _env_float("OURS_GAP", 0.005))
     rng = np.random.default_rng(_env_int("OURS_FAST_SEARCH_SEED", 20260519))
@@ -547,7 +547,7 @@ def _proposal_points(
         y = (rr + 0.5) * scorer.grid_height
         add_target(x, y, legalize=True)
 
-    global_cool = _env_int("OURS_FAST_SEARCH_GLOBAL_COOL_BINS", 12)
+    global_cool = _env_int("OURS_FAST_SEARCH_GLOBAL_COOL_BINS", 24)
     if global_cool > 0 and pressure.size > 0:
         k = min(max(global_cool * 4, global_cool), pressure.size)
         low_order = np.argpartition(pressure, k - 1)[:k]
@@ -559,7 +559,7 @@ def _proposal_points(
             y = (rr + 0.5) * scorer.grid_height
             add_target(x, y, legalize=True)
 
-    random_targets = _env_int("OURS_FAST_SEARCH_RANDOM_TARGETS", 6)
+    random_targets = _env_int("OURS_FAST_SEARCH_RANDOM_TARGETS", 8)
     for _ in range(max(0, random_targets)):
         x = float(rng.uniform(half_w, max(half_w, cw - half_w)))
         y = float(rng.uniform(half_h, max(half_h, ch - half_h)))

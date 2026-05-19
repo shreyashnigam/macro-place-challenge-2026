@@ -78,7 +78,7 @@ class ValidityFirstPlacer:
             selected = _try_soft_search_refine(selected, benchmark)
         if _env_bool("OURS_SNAP_SEARCH", "1"):
             selected = _try_snap_search_refine(selected, benchmark)
-        if _env_bool("OURS_FAST_SEARCH", "0"):
+        if _env_bool("OURS_FAST_SEARCH", "1"):
             selected = _try_fast_search_refine(selected, benchmark)
             if _env_bool("OURS_SOFT_SEARCH_AFTER_FAST", "0") and _env_bool("OURS_SOFT_SEARCH", "1"):
                 selected = _try_soft_search_refine(selected, benchmark)
