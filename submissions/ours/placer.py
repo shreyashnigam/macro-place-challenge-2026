@@ -783,6 +783,16 @@ def _select_by_fast_score(
     best_score = min(score for score, _, _, _ in scored)
     near_best = [item for item in scored if item[0] <= best_score + eps]
 
+    balanced_eps = _env_float("OURS_BALANCED_SELECTOR_EPS", 0.00125)
+    balanced_near = [
+        item
+        for item in scored
+        if item[2].endswith(":classic_balanced")
+        and item[0] <= best_score + balanced_eps
+    ]
+    if balanced_near:
+        return min(balanced_near, key=lambda item: item[0])[3]
+
     non_pin = [item for item in scored if not item[2].endswith(":pin_route_spread")]
     best_non_pin = min(non_pin, key=lambda item: item[0]) if non_pin else None
     pin_near = [item for item in near_best if item[2].endswith(":pin_route_spread")]
