@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import sys
 from typing import Iterable
 
 import numpy as np
@@ -55,6 +56,8 @@ class ValidityFirstPlacer:
             else None
         )
         selected = _select_by_fast_score(candidates, benchmark, selector_data, eps=self.selector_eps)
+        if _env_bool("OURS_REPLACE", "0"):
+            selected = _try_replace_refine(selected, benchmark)
         return selected
 
     def generate_candidates(self, benchmark: Benchmark) -> list[tuple[str, torch.Tensor]]:
@@ -972,6 +975,27 @@ def _select_by_proxy(
             best_cost = cost
             best = placement
     return best
+
+
+def _try_replace_refine(placement: torch.Tensor, benchmark: Benchmark) -> torch.Tensor:
+    try:
+        helper_dir = Path(__file__).resolve().parent
+        if str(helper_dir) not in sys.path:
+            sys.path.insert(0, str(helper_dir))
+        from replace_backend import refine_with_replace
+    except Exception:
+        return placement
+
+    try:
+        return refine_with_replace(
+            placement,
+            benchmark,
+            load_plc=_load_plc,
+            legalize_hard=_legalize_hard,
+            is_valid=_is_strictly_valid,
+        )
+    except Exception:
+        return placement
 
 
 def _load_plc(benchmark: Benchmark):
