@@ -124,6 +124,34 @@ def refine_with_soft_search(
         cold = _cold_centers(pressure, benchmark)
         round_improved = False
 
+        if _env_bool("OURS_SOFT_SEARCH_BULK", "0"):
+            for cand in _bulk_candidates(
+                current,
+                benchmark,
+                ranked,
+                node_nets,
+                nets,
+                cold,
+                round_idx,
+            ):
+                if total_trials >= max_trials:
+                    break
+                total_trials += 1
+                try:
+                    score = scorer.score(cand)
+                except Exception:
+                    continue
+                if int(score.get("overlap_count", 1)) != 0:
+                    continue
+                cost = float(score["proxy_cost"])
+                if cost + eps < best_fast:
+                    current = cand
+                    best_fast = cost
+                    accepted += 1
+                    round_improved = True
+                    if exact_stride > 0 and accepted - last_exact_accept >= exact_stride:
+                        checkpoint_exact(f"accepted:{accepted}")
+
         for macro_idx in ranked[:macro_count]:
             proposals = _proposal_points(
                 current,
@@ -334,6 +362,62 @@ def _connected_centroid(
     return np.mean(np.asarray(pts, dtype=np.float64), axis=0)
 
 
+def _bulk_candidates(
+    placement: np.ndarray,
+    benchmark: Benchmark,
+    ranked: list[int],
+    node_nets: list[list[int]],
+    nets: list[list[int]],
+    cold_centers: list[np.ndarray],
+    round_idx: int,
+) -> list[np.ndarray]:
+    if not ranked:
+        return []
+    counts = _env_int_list("OURS_SOFT_SEARCH_BULK_COUNTS", [32, 96, 256, 512])
+    alphas = _env_float_list("OURS_SOFT_SEARCH_BULK_ALPHAS", [0.18, 0.34, 0.55])
+    if not counts or not alphas:
+        return []
+    max_count = max(1, _env_int("OURS_SOFT_SEARCH_BULK_MAX", 512))
+    counts = sorted({max(1, min(int(c), len(ranked), max_count)) for c in counts})
+    out: list[np.ndarray] = []
+
+    for count in counts:
+        selected = ranked[:count]
+        for alpha in alphas:
+            for mode in ("mixed", "cold", "centroid"):
+                cand = placement.copy()
+                moved = 0
+                for order, idx_raw in enumerate(selected):
+                    idx = int(idx_raw)
+                    cur = placement[idx]
+                    centroid = _connected_centroid(placement, benchmark, idx, node_nets, nets)
+                    cold = None
+                    if cold_centers:
+                        cold = cold_centers[(order * 9973 + round_idx * 37) % len(cold_centers)]
+                    if mode == "centroid":
+                        if centroid is None:
+                            continue
+                        target = centroid
+                    elif mode == "cold":
+                        if cold is None:
+                            continue
+                        target = cold
+                    else:
+                        if centroid is not None and cold is not None:
+                            target = 0.68 * centroid + 0.32 * cold
+                        elif centroid is not None:
+                            target = centroid
+                        elif cold is not None:
+                            target = cold
+                        else:
+                            continue
+                    cand[idx] = _clamp_point(cur + float(alpha) * (target - cur), benchmark, idx)
+                    moved += 1
+                if moved > 0:
+                    out.append(cand)
+    return out
+
+
 def _clamp_point(point: np.ndarray, benchmark: Benchmark, macro_idx: int) -> np.ndarray:
     sizes = benchmark.macro_sizes.detach().cpu().numpy().astype(np.float64, copy=False)
     width = float(sizes[macro_idx, 0])
@@ -365,6 +449,34 @@ def _env_float(name: str, default: float) -> float:
         return float(_env(name, str(default)))
     except ValueError:
         return float(default)
+
+
+def _env_int_list(name: str, default: list[int]) -> list[int]:
+    raw = _env(name, ",".join(str(x) for x in default)).strip()
+    out: list[int] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(int(part))
+        except ValueError:
+            continue
+    return out or list(default)
+
+
+def _env_float_list(name: str, default: list[float]) -> list[float]:
+    raw = _env(name, ",".join(str(x) for x in default)).strip()
+    out: list[float] = []
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            out.append(float(part))
+        except ValueError:
+            continue
+    return out or list(default)
 
 
 def _debug(message: str) -> None:
