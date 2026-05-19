@@ -1,6 +1,11 @@
 name: RePlAce Smoke
 
 on:
+  push:
+    paths:
+      - ".github/workflows/replace-smoke.yml"
+      - "submissions/ours/**"
+      - "scripts/run_experiment.py"
   workflow_dispatch:
     inputs:
       benchmark:
