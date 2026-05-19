@@ -74,8 +74,9 @@ class FastProxy:
             native = self._score_native(pos)
             if native is not None:
                 return native
+        density_map = self.density_map(pos) if maps else None
         wirelength = self.wirelength_cost(pos)
-        density = self.density_cost(pos)
+        density = self.density_cost(pos, density_map)
         congestion_result = self.congestion_cost(pos, maps=maps)
         if maps:
             congestion, v_map, h_map, extras = congestion_result
@@ -94,6 +95,7 @@ class FastProxy:
         if maps:
             result["v_routing_cong"] = v_map
             result["h_routing_cong"] = h_map
+            result["density_map"] = density_map
             result.update(extras)
         return result
 
@@ -155,7 +157,7 @@ class FastProxy:
             total += net.hpwl_weight * hpwl
         return total / max((self.canvas_width + self.canvas_height) * self.net_count, 1e-12)
 
-    def density_cost(self, pos: np.ndarray) -> float:
+    def density_map(self, pos: np.ndarray) -> np.ndarray:
         occupied = np.zeros(self.grid_size, dtype=np.float64)
         for idx in range(self.num_macros):
             self._add_rect_to_grid(
@@ -166,7 +168,11 @@ class FastProxy:
                 float(self.sizes[idx, 1]),
                 scale=1.0,
             )
-        densities = occupied / max(self.grid_area, 1e-12)
+        return occupied / max(self.grid_area, 1e-12)
+
+    def density_cost(self, pos: np.ndarray, densities: np.ndarray | None = None) -> float:
+        if densities is None:
+            densities = self.density_map(pos)
         return 0.5 * _abu_nonzero_top(densities, 0.10, self.grid_size)
 
     def congestion_cost(self, pos: np.ndarray, *, maps: bool = False):

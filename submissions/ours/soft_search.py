@@ -258,7 +258,12 @@ def _pressure_map(score_with_maps: dict[str, object], benchmark: Benchmark) -> n
     cols = int(benchmark.grid_cols)
     v = np.asarray(score_with_maps["v_routing_cong"], dtype=np.float64).reshape(rows, cols)
     h = np.asarray(score_with_maps["h_routing_cong"], dtype=np.float64).reshape(rows, cols)
-    return v + h
+    pressure = v + h
+    density_weight = _env_float("OURS_SOFT_SEARCH_DENSITY_WEIGHT", 0.0)
+    if density_weight > 0.0 and "density_map" in score_with_maps:
+        density = np.asarray(score_with_maps["density_map"], dtype=np.float64).reshape(rows, cols)
+        pressure = pressure + density_weight * density
+    return pressure
 
 
 def _rank_soft_macros(
