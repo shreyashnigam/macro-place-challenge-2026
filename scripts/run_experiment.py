@@ -203,26 +203,29 @@ def _print_table(results: list[dict], summary: dict) -> None:
     if has_winner:
         print(
             f"{'bench':>7}  {'proxy':>8}  {'wl':>7}  {'den':>7}  {'cong':>7}  "
-            f"{'ov':>3}  {'rt':>7}  winner"
+            f"{'ov':>3}  {'valid':>5}  {'rt':>7}  winner"
         )
-        print("-" * 82)
+        print("-" * 89)
     else:
-        print(f"{'bench':>7}  {'proxy':>8}  {'wl':>7}  {'den':>7}  {'cong':>7}  {'ov':>3}  {'rt':>7}")
-        print("-" * 56)
+        print(
+            f"{'bench':>7}  {'proxy':>8}  {'wl':>7}  {'den':>7}  {'cong':>7}  "
+            f"{'ov':>3}  {'valid':>5}  {'rt':>7}"
+        )
+        print("-" * 63)
     for r in results:
         line = (
             f"{r['name']:>7}  {r['proxy_cost']:>8.4f}  {r['wirelength']:>7.3f}  "
             f"{r['density']:>7.3f}  {r['congestion']:>7.3f}  {r['overlaps']:>3}  "
-            f"{r['runtime']:>6.2f}s"
+            f"{str(bool(r['valid'])):>5}  {r['runtime']:>6.2f}s"
         )
         if has_winner:
             line += f"  {r.get('winner', '')}"
         print(line)
-    print("-" * (82 if has_winner else 56))
+    print("-" * (89 if has_winner else 63))
     print(
         f"{'AVG':>7}  {summary['avg_proxy']:>8.4f}  {summary['avg_wirelength']:>7.3f}  "
         f"{summary['avg_density']:>7.3f}  {summary['avg_congestion']:>7.3f}  "
-        f"{summary['total_overlaps']:>3}  {summary['total_runtime']:>6.2f}s"
+        f"{summary['total_overlaps']:>3}  {'':>5}  {summary['total_runtime']:>6.2f}s"
     )
     print(
         f"target={summary['target']:.4f}  gap={summary['gap_to_target']:+.4f}  "
