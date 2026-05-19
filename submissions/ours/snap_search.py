@@ -50,8 +50,8 @@ def refine_with_snap_search(
         return baseline
 
     rounds = max(1, _env_int("OURS_SNAP_ROUNDS", 3))
-    macro_count = max(1, _env_int("OURS_SNAP_MACROS", 400))
-    max_trials = max(0, _env_int("OURS_SNAP_TRIALS", 3000))
+    macro_count = max(1, _env_int("OURS_SNAP_MACROS", 600))
+    max_trials = max(0, _env_int("OURS_SNAP_TRIALS", 5000))
     if max_trials <= 0:
         return baseline
 
