@@ -84,7 +84,7 @@ class ValidityFirstPlacer:
                 selected = _try_soft_search_refine(selected, benchmark)
         if _env_bool("OURS_REPLACE", "0"):
             selected = _try_replace_refine(selected, benchmark)
-        return selected
+        return _finalize_placement(selected, benchmark)
 
     def _try_pipeline_portfolio(
         self,
@@ -1434,6 +1434,13 @@ def _row_pack_fallback(benchmark: Benchmark, *, gap: float = 0.001) -> torch.Ten
 
 
 def _is_strictly_valid(placement: torch.Tensor, benchmark: Benchmark) -> bool:
+    try:
+        from macro_place.utils import validate_placement
+
+        return bool(validate_placement(placement, benchmark)[0])
+    except Exception:
+        pass
+
     if placement.shape != (benchmark.num_macros, 2):
         return False
     if torch.isnan(placement).any() or torch.isinf(placement).any():
@@ -1480,11 +1487,51 @@ def _clamp_np(pos: np.ndarray, half_w: np.ndarray, half_h: np.ndarray, cw: float
     pos[:, 1] = np.clip(pos[:, 1], half_h, ch - half_h)
 
 
+def _finalize_placement(placement: torch.Tensor, benchmark: Benchmark) -> torch.Tensor:
+    out = placement.detach().clone().float()
+    _clamp_all(out, benchmark)
+    if _is_strictly_valid(out, benchmark):
+        return out
+
+    try:
+        repaired = _legalize_hard(
+            out,
+            benchmark,
+            gap=_env_float("OURS_GAP", 0.005),
+            max_rounds=_env_int("OURS_FINAL_LEGALIZE_ROUNDS", 500),
+        )
+    except Exception:
+        repaired = out
+    _clamp_all(repaired, benchmark)
+    if _is_strictly_valid(repaired, benchmark):
+        return repaired.detach().clone().float()
+
+    fallback = _row_pack_fallback(benchmark, gap=max(_env_float("OURS_GAP", 0.005), 0.001))
+    _clamp_all(fallback, benchmark)
+    return fallback.detach().clone().float()
+
+
 def _clamp_all(placement: torch.Tensor, benchmark: Benchmark) -> None:
     sizes = benchmark.macro_sizes
-    placement[:, 0].clamp_(sizes[:, 0] / 2, float(benchmark.canvas_width) - sizes[:, 0] / 2)
-    placement[:, 1].clamp_(sizes[:, 1] / 2, float(benchmark.canvas_height) - sizes[:, 1] / 2)
-    placement[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
+    margin = max(0.0, _env_float("OURS_BOUNDARY_MARGIN", 1e-4))
+    fixed = benchmark.macro_fixed
+    movable = ~fixed
+    lower_x = sizes[:, 0] / 2 + margin
+    upper_x = float(benchmark.canvas_width) - sizes[:, 0] / 2 - margin
+    lower_y = sizes[:, 1] / 2 + margin
+    upper_y = float(benchmark.canvas_height) - sizes[:, 1] / 2 - margin
+    lower_x = torch.minimum(lower_x, upper_x)
+    lower_y = torch.minimum(lower_y, upper_y)
+    if movable.any():
+        placement[movable, 0] = torch.minimum(
+            torch.maximum(placement[movable, 0], lower_x[movable]),
+            upper_x[movable],
+        )
+        placement[movable, 1] = torch.minimum(
+            torch.maximum(placement[movable, 1], lower_y[movable]),
+            upper_y[movable],
+        )
+    placement[fixed] = benchmark.macro_positions[fixed]
 
 
 def _boxes_overlap(a: Iterable[float], b: Iterable[float], *, gap: float) -> bool:

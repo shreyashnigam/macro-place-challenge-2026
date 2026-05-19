@@ -621,8 +621,13 @@ def _clamp_point(point: np.ndarray, benchmark: Benchmark, macro_idx: int) -> np.
     height = float(sizes[macro_idx, 1])
     half_w = 0.5 * width
     half_h = 0.5 * height
-    x = float(np.clip(float(point[0]), half_w, float(benchmark.canvas_width) - half_w))
-    y = float(np.clip(float(point[1]), half_h, float(benchmark.canvas_height) - half_h))
+    margin = max(0.0, _env_float("OURS_BOUNDARY_MARGIN", 1e-4))
+    x_lo = min(half_w + margin, float(benchmark.canvas_width) - half_w - margin)
+    y_lo = min(half_h + margin, float(benchmark.canvas_height) - half_h - margin)
+    x_hi = float(benchmark.canvas_width) - half_w - margin
+    y_hi = float(benchmark.canvas_height) - half_h - margin
+    x = float(np.clip(float(point[0]), x_lo, x_hi))
+    y = float(np.clip(float(point[1]), y_lo, y_hi))
     return np.asarray([x, y], dtype=np.float64)
 
 
