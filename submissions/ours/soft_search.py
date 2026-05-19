@@ -185,7 +185,8 @@ def refine_with_soft_search(
         )
         return candidate.detach().clone().float()
 
-    checkpoint_exact("final")
+    if last_exact_accept != accepted:
+        checkpoint_exact("final")
     if (
         best_exact is not None
         and best_exact_cost is not None
