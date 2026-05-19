@@ -1037,6 +1037,7 @@ def _try_fast_search_refine(placement: torch.Tensor, benchmark: Benchmark) -> to
             placement,
             benchmark,
             load_plc=_load_plc,
+            legalize_hard=_legalize_hard,
             is_valid=_is_strictly_valid,
         )
     except Exception:

@@ -12,8 +12,14 @@ are still guarded by the official scorer before replacing a baseline.
 
 from __future__ import annotations
 
+import ctypes
 from dataclasses import dataclass
+import hashlib
 import math
+import os
+import platform
+import subprocess
+import tempfile
 from typing import Iterable
 
 import numpy as np
@@ -57,9 +63,17 @@ class FastProxy:
         self.sizes = benchmark.macro_sizes.detach().cpu().numpy().astype(np.float64, copy=True)
         self.port_positions = benchmark.port_positions.detach().cpu().numpy().astype(np.float64, copy=True)
         self.nets = self._extract_nets(benchmark, plc)
+        self._native = None
+        self._native_arrays = self._build_native_arrays()
+        if _env_bool("OURS_FAST_PROXY_NATIVE", "1"):
+            self._native = _load_native()
 
     def score(self, placement: torch.Tensor | np.ndarray, *, maps: bool = False) -> dict[str, object]:
         pos = _as_numpy(placement)
+        if not maps and self._native is not None:
+            native = self._score_native(pos)
+            if native is not None:
+                return native
         wirelength = self.wirelength_cost(pos)
         density = self.density_cost(pos)
         congestion_result = self.congestion_cost(pos, maps=maps)
@@ -82,6 +96,52 @@ class FastProxy:
             result["h_routing_cong"] = h_map
             result.update(extras)
         return result
+
+    def _score_native(self, pos: np.ndarray) -> dict[str, object] | None:
+        arrays = self._native_arrays
+        if arrays is None or self._native is None:
+            return None
+        pos_c = np.ascontiguousarray(pos, dtype=np.float64)
+        out = np.zeros(5, dtype=np.float64)
+        try:
+            rc = self._native.score_proxy_native(
+                ctypes.c_int(self.num_macros),
+                ctypes.c_int(self.num_hard),
+                ctypes.c_int(len(self.port_positions)),
+                ctypes.c_int(len(self.nets)),
+                ctypes.c_int(self.grid_rows),
+                ctypes.c_int(self.grid_cols),
+                ctypes.c_double(self.canvas_width),
+                ctypes.c_double(self.canvas_height),
+                ctypes.c_double(self.hroutes_per_micron),
+                ctypes.c_double(self.vroutes_per_micron),
+                ctypes.c_int(self.smooth_range),
+                ctypes.c_double(self.hrouting_alloc),
+                ctypes.c_double(self.vrouting_alloc),
+                ctypes.c_double(self.net_count),
+                _ptr_double(pos_c),
+                _ptr_double(self.sizes),
+                _ptr_double(self.port_positions),
+                _ptr_int(arrays["starts"]),
+                _ptr_int(arrays["owners"]),
+                _ptr_double(arrays["offsets"]),
+                _ptr_int(arrays["source_owner"]),
+                _ptr_double(arrays["source_offsets"]),
+                _ptr_double(arrays["hpwl"]),
+                _ptr_double(arrays["route"]),
+                _ptr_double(out),
+            )
+        except Exception:
+            return None
+        if int(rc) != 0:
+            return None
+        return {
+            "proxy_cost": float(out[0]),
+            "wirelength_cost": float(out[1]),
+            "density_cost": float(out[2]),
+            "congestion_cost": float(out[3]),
+            "overlap_count": int(round(float(out[4]))),
+        }
 
     def wirelength_cost(self, pos: np.ndarray) -> float:
         total = 0.0
@@ -229,6 +289,35 @@ class FastProxy:
                 )
             )
         return nets
+
+    def _build_native_arrays(self) -> dict[str, np.ndarray] | None:
+        try:
+            starts = [0]
+            owners: list[int] = []
+            offsets: list[float] = []
+            source_owner: list[int] = []
+            source_offsets: list[float] = []
+            hpwl: list[float] = []
+            route: list[float] = []
+            for net in self.nets:
+                owners.extend(int(x) for x in net.owners.tolist())
+                offsets.extend(float(x) for x in net.offsets.reshape(-1).tolist())
+                starts.append(len(owners))
+                source_owner.append(int(net.source_owner))
+                source_offsets.extend(float(x) for x in net.source_offset.reshape(-1).tolist())
+                hpwl.append(float(net.hpwl_weight))
+                route.append(float(net.route_weight))
+            return {
+                "starts": np.ascontiguousarray(np.asarray(starts, dtype=np.int32)),
+                "owners": np.ascontiguousarray(np.asarray(owners, dtype=np.int32)),
+                "offsets": np.ascontiguousarray(np.asarray(offsets, dtype=np.float64)),
+                "source_owner": np.ascontiguousarray(np.asarray(source_owner, dtype=np.int32)),
+                "source_offsets": np.ascontiguousarray(np.asarray(source_offsets, dtype=np.float64)),
+                "hpwl": np.ascontiguousarray(np.asarray(hpwl, dtype=np.float64)),
+                "route": np.ascontiguousarray(np.asarray(route, dtype=np.float64)),
+            }
+        except Exception:
+            return None
 
     def _owner_offset_for_pin(self, plc, pin_idx: int, name_to_owner: dict[str, int]) -> tuple[int, tuple[float, float]] | None:
         pin = plc.modules_w_pins[pin_idx]
@@ -522,3 +611,80 @@ def _abu_all_top(values: np.ndarray, frac: float) -> float:
     k = min(cnt, values.size)
     top = np.partition(values, -k)[-k:]
     return float(np.mean(top))
+
+
+def _env_bool(name: str, default: str) -> bool:
+    return os.environ.get(name, default).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _ptr_double(arr: np.ndarray):
+    return np.ascontiguousarray(arr, dtype=np.float64).ctypes.data_as(ctypes.POINTER(ctypes.c_double))
+
+
+def _ptr_int(arr: np.ndarray):
+    return np.ascontiguousarray(arr, dtype=np.int32).ctypes.data_as(ctypes.POINTER(ctypes.c_int))
+
+
+_NATIVE_LIB = None
+_NATIVE_TRIED = False
+
+
+def _load_native():
+    global _NATIVE_LIB, _NATIVE_TRIED
+    if _NATIVE_TRIED:
+        return _NATIVE_LIB
+    _NATIVE_TRIED = True
+    src = os.path.join(os.path.dirname(__file__), "fast_proxy_native.cpp")
+    if not os.path.exists(src):
+        return None
+    try:
+        with open(src, "rb") as f:
+            digest = hashlib.sha1(f.read()).hexdigest()[:16]
+        suffix = "dylib" if platform.system() == "Darwin" else "so"
+        out = os.path.join(tempfile.gettempdir(), f"ours_fast_proxy_native_{digest}.{suffix}")
+        if not os.path.exists(out):
+            cmd = ["g++", "-O3", "-std=c++17", "-fPIC", src, "-o", out]
+            if platform.system() == "Darwin":
+                cmd.insert(3, "-dynamiclib")
+            else:
+                cmd.insert(3, "-shared")
+            subprocess.run(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True,
+                timeout=30,
+            )
+        lib = ctypes.CDLL(out)
+        lib.score_proxy_native.restype = ctypes.c_int
+        lib.score_proxy_native.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_int,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.c_double,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+        ]
+        _NATIVE_LIB = lib
+    except Exception:
+        _NATIVE_LIB = None
+    return _NATIVE_LIB
