@@ -282,41 +282,55 @@ def _refine_with_soft_search_portfolio(
     parsed_modes = [mode.strip().lower() for mode in modes.split(",") if mode.strip()]
     if not parsed_modes:
         parsed_modes = ["single", "bulk"]
+    routes = _env("OURS_SOFT_SEARCH_PORTFOLIO_ROUTES", "auto")
+    parsed_routes = [route.strip().lower() for route in routes.split(",") if route.strip()]
+    if not parsed_routes:
+        parsed_routes = ["auto"]
 
     old_active = os.environ.get("_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE")
     old_bulk = os.environ.get("OURS_SOFT_SEARCH_BULK")
     old_seed = os.environ.get("OURS_SOFT_SEARCH_SEED")
+    old_route = os.environ.get("OURS_SOFT_SEARCH_ROUTE_WEIGHT")
     os.environ["_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE"] = "1"
     try:
-        for mode_idx, mode in enumerate(parsed_modes):
-            if mode in {"single", "solo", "greedy"}:
-                os.environ["OURS_SOFT_SEARCH_BULK"] = "0"
-            elif mode in {"bulk", "batch"}:
-                os.environ["OURS_SOFT_SEARCH_BULK"] = "1"
+        for route_idx, route in enumerate(parsed_routes):
+            if route in {"auto", "adaptive", "default"}:
+                os.environ.pop("OURS_SOFT_SEARCH_ROUTE_WEIGHT", None)
             else:
-                continue
-            os.environ["OURS_SOFT_SEARCH_SEED"] = str(base_seed + 1009 * mode_idx)
-            candidate = refine_with_soft_search(
-                baseline,
-                benchmark,
-                load_plc=load_plc,
-                is_valid=is_valid,
-            )
-            if torch.allclose(candidate, baseline, atol=1e-7, rtol=0.0):
-                continue
-            if not is_valid(candidate, benchmark):
-                continue
-            try:
-                costs = compute_proxy_cost(candidate.detach().float(), benchmark, plc)
-            except Exception:
-                continue
-            if int(costs.get("overlap_count", 1)) != 0:
-                continue
-            cost = float(costs["proxy_cost"])
-            if cost < best_cost - eps:
-                best = candidate.detach().clone().float()
-                best_cost = cost
-                _debug(f"portfolio mode={mode} exact={best_cost:.6f}")
+                try:
+                    os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = str(max(0.0, float(route)))
+                except ValueError:
+                    continue
+            for mode_idx, mode in enumerate(parsed_modes):
+                if mode in {"single", "solo", "greedy"}:
+                    os.environ["OURS_SOFT_SEARCH_BULK"] = "0"
+                elif mode in {"bulk", "batch"}:
+                    os.environ["OURS_SOFT_SEARCH_BULK"] = "1"
+                else:
+                    continue
+                seed = base_seed + 1009 * mode_idx + 104729 * route_idx
+                os.environ["OURS_SOFT_SEARCH_SEED"] = str(seed)
+                candidate = refine_with_soft_search(
+                    baseline,
+                    benchmark,
+                    load_plc=load_plc,
+                    is_valid=is_valid,
+                )
+                if torch.allclose(candidate, baseline, atol=1e-7, rtol=0.0):
+                    continue
+                if not is_valid(candidate, benchmark):
+                    continue
+                try:
+                    costs = compute_proxy_cost(candidate.detach().float(), benchmark, plc)
+                except Exception:
+                    continue
+                if int(costs.get("overlap_count", 1)) != 0:
+                    continue
+                cost = float(costs["proxy_cost"])
+                if cost < best_cost - eps:
+                    best = candidate.detach().clone().float()
+                    best_cost = cost
+                    _debug(f"portfolio route={route} mode={mode} exact={best_cost:.6f}")
     finally:
         if old_active is None:
             os.environ.pop("_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE", None)
@@ -330,6 +344,10 @@ def _refine_with_soft_search_portfolio(
             os.environ.pop("OURS_SOFT_SEARCH_SEED", None)
         else:
             os.environ["OURS_SOFT_SEARCH_SEED"] = old_seed
+        if old_route is None:
+            os.environ.pop("OURS_SOFT_SEARCH_ROUTE_WEIGHT", None)
+        else:
+            os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = old_route
 
     return best
 
