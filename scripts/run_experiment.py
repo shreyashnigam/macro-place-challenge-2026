@@ -22,6 +22,7 @@ from macro_place.objective import compute_proxy_cost
 from macro_place.utils import validate_placement
 
 
+SMOKE_BENCHMARKS = ["ibm08", "ibm15"]
 QUICK_BENCHMARKS = ["ibm01", "ibm03", "ibm08", "ibm10", "ibm15", "ibm17"]
 QUICK_LITE_BENCHMARKS = ["ibm01", "ibm08", "ibm15"]
 
@@ -29,6 +30,8 @@ QUICK_LITE_BENCHMARKS = ["ibm01", "ibm08", "ibm15"]
 def _parse_benchmarks(args: argparse.Namespace) -> list[str]:
     if args.benchmarks:
         return [item.strip() for item in args.benchmarks.split(",") if item.strip()]
+    if args.smoke:
+        return SMOKE_BENCHMARKS
     if args.quick_lite:
         return QUICK_LITE_BENCHMARKS
     if args.quick:
@@ -235,6 +238,11 @@ def main() -> None:
     parser.add_argument("--out-dir", default="experiments", help="Directory for run records.")
     parser.add_argument("--benchmark", "-b", default="ibm01", help="Single benchmark name.")
     parser.add_argument("--benchmarks", help="Comma-separated benchmark names.")
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="Run the fastest prelim subset: ibm08, ibm15.",
+    )
     parser.add_argument(
         "--quick-lite",
         action="store_true",
