@@ -27,6 +27,7 @@ CPUS="${EVAL_CPUS:-16}"
 MEMORY="${EVAL_MEMORY:-100g}"
 TIMEOUT_SECONDS="${EVAL_TIMEOUT_SECONDS:-3600}"
 GPUS="${EVAL_GPUS:-none}"
+PASSTHROUGH_ENV_VARS="${EVAL_ENV_VARS:-}"
 
 BENCHMARKS=(
     ibm01 ibm02 ibm03 ibm04 ibm06 ibm07 ibm08 ibm09 ibm10
@@ -56,6 +57,17 @@ if [[ "$GPUS" != "none" && "$GPUS" != "0" ]]; then
     GPU_ARGS=("--gpus" "$GPUS")
 fi
 
+ENV_ARGS=()
+if [[ -n "$PASSTHROUGH_ENV_VARS" ]]; then
+    IFS=',' read -ra ENV_NAMES <<< "$PASSTHROUGH_ENV_VARS"
+    for env_name in "${ENV_NAMES[@]}"; do
+        env_name="$(xargs <<< "$env_name")"
+        if [[ -n "$env_name" && -n "${!env_name-}" ]]; then
+            ENV_ARGS+=("-e" "$env_name=${!env_name}")
+        fi
+    done
+fi
+
 SUMMARY="$RUN_DIR/summary.tsv"
 COMBINED_LOG="$RUN_DIR/combined.log"
 : > "$COMBINED_LOG"
@@ -81,6 +93,7 @@ for bench in "${BENCHMARKS[@]}"; do
         "${GPU_ARGS[@]}" \
         --memory "$MEMORY" \
         --cpus "$CPUS" \
+        "${ENV_ARGS[@]}" \
         "${MOUNT_ARGS[@]}" \
         "$IMAGE_NAME" \
         "/submission/$PLACER_FILE" --benchmark "$bench" \
