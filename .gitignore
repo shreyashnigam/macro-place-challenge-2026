@@ -47,6 +47,7 @@ htmlcov/
 # Data and results
 benchmarks/raw/
 results/
+experiments/
 *.pt
 *.pth
 *.ckpt
@@ -59,6 +60,7 @@ results/
 # Logs
 *.log
 logs/
+LOG.md
 
 # Jupyter
 .ipynb_checkpoints/
