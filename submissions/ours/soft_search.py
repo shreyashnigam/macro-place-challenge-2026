@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+import math
 from typing import Callable
 
 import numpy as np
@@ -129,7 +130,15 @@ def refine_with_soft_search(
         except Exception:
             break
         pressure = _pressure_map(maps, benchmark)
-        ranked = _rank_soft_macros(current, benchmark, soft_indices, node_nets, pressure)
+        ranked = _rank_soft_macros(
+            current,
+            benchmark,
+            soft_indices,
+            node_nets,
+            nets,
+            pressure,
+            route_weight=_soft_route_weight(maps),
+        )
         if not ranked:
             break
         cold = _cold_centers(pressure, benchmark)
@@ -359,12 +368,25 @@ def _rank_soft_macros(
     benchmark: Benchmark,
     soft_indices: np.ndarray,
     node_nets: list[list[int]],
+    nets: list[list[int]],
     pressure: np.ndarray,
+    route_weight: float,
 ) -> list[int]:
     rows, cols = pressure.shape
     bin_w = float(benchmark.canvas_width) / max(cols, 1)
     bin_h = float(benchmark.canvas_height) / max(rows, 1)
     sizes = benchmark.macro_sizes.detach().cpu().numpy().astype(np.float64, copy=False)
+    route_scores = (
+        _soft_route_participation_scores(
+            placement,
+            benchmark,
+            soft_indices,
+            nets,
+            pressure,
+        )
+        if route_weight > 0.0
+        else {}
+    )
     ranked: list[tuple[float, int]] = []
     for idx_raw in soft_indices:
         idx = int(idx_raw)
@@ -373,10 +395,92 @@ def _rank_soft_macros(
         row = min(rows - 1, max(0, int(float(y) / max(bin_h, 1e-12))))
         area = float(sizes[idx, 0] * sizes[idx, 1])
         degree = float(len(node_nets[idx]))
-        score = float(pressure[row, col]) * (1.0 + 0.001 * area) + 0.001 * degree
+        score = (
+            float(pressure[row, col]) * (1.0 + 0.001 * area)
+            + 0.001 * degree
+            + route_weight * float(route_scores.get(idx, 0.0))
+        )
         ranked.append((score, idx))
     ranked.sort(reverse=True)
     return [idx for _, idx in ranked]
+
+
+def _soft_route_weight(score_with_maps: dict[str, object]) -> float:
+    raw = os.environ.get("OURS_SOFT_SEARCH_ROUTE_WEIGHT")
+    if raw is not None:
+        try:
+            return max(0.0, float(raw))
+        except ValueError:
+            return 0.0
+    proxy = float(score_with_maps.get("proxy_cost", 0.0))
+    congestion = float(score_with_maps.get("congestion_cost", 0.0))
+    if (
+        proxy >= _env_float("OURS_SOFT_SEARCH_ROUTE_MIN_PROXY", 1.20)
+        or congestion >= _env_float("OURS_SOFT_SEARCH_ROUTE_MIN_CONG", 1.45)
+    ):
+        return _env_float("OURS_SOFT_SEARCH_ROUTE_AUTO_WEIGHT", 0.25)
+    return 0.0
+
+
+def _soft_route_participation_scores(
+    placement: np.ndarray,
+    benchmark: Benchmark,
+    soft_indices: np.ndarray,
+    nets: list[list[int]],
+    pressure: np.ndarray,
+) -> dict[int, float]:
+    if pressure.size == 0 or soft_indices.size == 0:
+        return {}
+    rows, cols = pressure.shape
+    bin_w = float(benchmark.canvas_width) / max(cols, 1)
+    bin_h = float(benchmark.canvas_height) / max(rows, 1)
+    n_all = int(benchmark.num_macros)
+    soft_set = {int(idx) for idx in soft_indices.tolist()}
+    ports = benchmark.port_positions.detach().cpu().numpy().astype(np.float64, copy=False)
+    integral = np.pad(pressure, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+    scores: dict[int, float] = {idx: 0.0 for idx in soft_set}
+
+    for nodes in nets:
+        soft_nodes = [idx for idx in nodes if idx in soft_set]
+        if not soft_nodes:
+            continue
+        cells: list[tuple[int, int]] = []
+        for node in nodes:
+            if 0 <= node < n_all:
+                x, y = placement[node]
+            else:
+                port_idx = int(node) - n_all
+                if not (0 <= port_idx < len(ports)):
+                    continue
+                x, y = ports[port_idx]
+            col = min(cols - 1, max(0, int(float(x) / max(bin_w, 1e-12))))
+            row = min(rows - 1, max(0, int(float(y) / max(bin_h, 1e-12))))
+            cells.append((row, col))
+        if len(cells) <= 1:
+            continue
+        r0 = min(row for row, _ in cells)
+        r1 = max(row for row, _ in cells)
+        c0 = min(col for _, col in cells)
+        c1 = max(col for _, col in cells)
+        area = max(1, (r1 - r0 + 1) * (c1 - c0 + 1))
+        total = (
+            integral[r1 + 1, c1 + 1]
+            - integral[r0, c1 + 1]
+            - integral[r1 + 1, c0]
+            + integral[r0, c0]
+        )
+        participation = float(total) / float(area)
+        if participation <= 0.0:
+            continue
+        inc = participation / max(1.0, math.sqrt(float(len(soft_nodes))))
+        for idx in soft_nodes:
+            scores[idx] += inc
+
+    max_score = max(scores.values(), default=0.0)
+    if max_score > 0.0:
+        for idx in list(scores):
+            scores[idx] /= max_score
+    return scores
 
 
 def _cold_centers(pressure: np.ndarray, benchmark: Benchmark) -> list[np.ndarray]:
