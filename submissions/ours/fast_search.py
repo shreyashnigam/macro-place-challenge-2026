@@ -70,6 +70,20 @@ def refine_with_fast_search(
             best_fast = lns_fast
             _debug(f"lns improved fast={best_fast:.6f}")
 
+    if _env_bool("OURS_FAST_SEARCH_PAIR_LEGAL", "0") and legalize_hard is not None:
+        pair_best, pair_fast = _pair_legal_swap_refine(
+            best,
+            benchmark,
+            scorer,
+            legalize_hard=legalize_hard,
+            is_valid=is_valid,
+            start_fast=best_fast,
+        )
+        if pair_fast + eps < best_fast:
+            best = pair_best
+            best_fast = pair_fast
+            _debug(f"pair legal improved fast={best_fast:.6f}")
+
     for round_idx in range(rounds):
         try:
             score_with_maps = scorer.score(best, maps=True)
@@ -167,6 +181,101 @@ def refine_with_fast_search(
         f"fast={best_fast:.6f}"
     )
     return baseline
+
+
+def _pair_legal_swap_refine(
+    baseline: torch.Tensor,
+    benchmark: Benchmark,
+    scorer,
+    *,
+    legalize_hard: Callable[..., torch.Tensor],
+    is_valid: Callable[[torch.Tensor, Benchmark], bool],
+    start_fast: float,
+) -> tuple[torch.Tensor, float]:
+    n_hard = int(benchmark.num_hard_macros)
+    if n_hard <= 1:
+        return baseline, start_fast
+    fixed = benchmark.macro_fixed[:n_hard].detach().cpu().numpy().astype(bool, copy=False)
+    gap = _env_float("OURS_FAST_SEARCH_GAP", _env_float("OURS_GAP", 0.005))
+    trials = max(0, _env_int("OURS_FAST_SEARCH_PAIR_TRIALS", 80))
+    pool_size = max(2, _env_int("OURS_FAST_SEARCH_PAIR_POOL", 36))
+    neighbor_count = max(1, _env_int("OURS_FAST_SEARCH_PAIR_NEIGHBORS", 10))
+    if trials <= 0:
+        return baseline, start_fast
+
+    try:
+        maps = scorer.score(baseline, maps=True)
+        pressure = np.asarray(maps["v_routing_cong"], dtype=np.float64) + np.asarray(
+            maps["h_routing_cong"],
+            dtype=np.float64,
+        )
+        ranked = [idx for idx in _rank_hot_macros(baseline, benchmark, scorer, pressure) if not fixed[idx]]
+    except Exception:
+        ranked = [idx for idx in range(n_hard) if not fixed[idx]]
+    if len(ranked) < 2:
+        return baseline, start_fast
+
+    pos = baseline[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    sizes = benchmark.macro_sizes[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    area = sizes[:, 0] * sizes[:, 1]
+    pool = ranked[: min(pool_size, len(ranked))]
+    pair_keys: list[tuple[float, int, int]] = []
+    for a in pool:
+        deltas = pos - pos[a]
+        dist2 = np.sum(deltas * deltas, axis=1)
+        order = np.argsort(dist2)
+        added = 0
+        for b_raw in order:
+            b = int(b_raw)
+            if b == a or fixed[b]:
+                continue
+            area_ratio = max(float(area[a]), float(area[b])) / max(min(float(area[a]), float(area[b])), 1e-9)
+            priority = float(dist2[b]) * (1.0 + 0.05 * area_ratio)
+            pair_keys.append((priority, int(a), b))
+            added += 1
+            if added >= neighbor_count:
+                break
+    pair_keys.sort()
+
+    best = baseline.detach().clone().float()
+    best_fast = float(start_fast)
+    seen: set[tuple[int, int]] = set()
+    tried = 0
+    for _, a, b in pair_keys:
+        if tried >= trials:
+            break
+        key = (min(a, b), max(a, b))
+        if key in seen:
+            continue
+        seen.add(key)
+        tried += 1
+        candidate = best.detach().clone().float()
+        tmp = candidate[a].clone()
+        candidate[a] = candidate[b]
+        candidate[b] = tmp
+        try:
+            candidate = legalize_hard(
+                candidate,
+                benchmark,
+                gap=gap,
+                max_rounds=_env_int("OURS_FAST_SEARCH_PAIR_LEGAL_ROUNDS", 240),
+            )
+        except TypeError:
+            candidate = legalize_hard(candidate, benchmark)
+        if not is_valid(candidate, benchmark):
+            continue
+        try:
+            score = scorer.score(candidate)
+        except Exception:
+            continue
+        if int(score.get("overlap_count", 1)) != 0:
+            continue
+        cost = float(score["proxy_cost"])
+        if cost < best_fast - _env_float("OURS_FAST_SEARCH_EPS", 1e-5):
+            best = candidate.detach().clone().float()
+            best_fast = cost
+            _debug(f"pair legal swap a={a} b={b} fast={best_fast:.6f} tried={tried}")
+    return best, best_fast
 
 
 def _overlap_lns_refine(
