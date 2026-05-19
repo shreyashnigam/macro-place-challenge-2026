@@ -60,12 +60,16 @@ class ValidityFirstPlacer:
             selected = _try_batch_analytical_refine(selected, benchmark)
         if _env_bool("OURS_ANALYTICAL", "1"):
             selected = _try_analytical_refine(selected, benchmark)
+        if _env_bool("OURS_FAST_SEARCH_PRE_SOFT", "0"):
+            selected = _try_fast_search_refine(selected, benchmark)
         if _env_bool("OURS_SOFT_SEARCH", "1"):
             selected = _try_soft_search_refine(selected, benchmark)
         if _env_bool("OURS_SNAP_SEARCH", "1"):
             selected = _try_snap_search_refine(selected, benchmark)
         if _env_bool("OURS_FAST_SEARCH", "0"):
             selected = _try_fast_search_refine(selected, benchmark)
+            if _env_bool("OURS_SOFT_SEARCH_AFTER_FAST", "0") and _env_bool("OURS_SOFT_SEARCH", "1"):
+                selected = _try_soft_search_refine(selected, benchmark)
         if _env_bool("OURS_REPLACE", "0"):
             selected = _try_replace_refine(selected, benchmark)
         return selected
