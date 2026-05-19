@@ -58,6 +58,16 @@ def refine_with_analytical(
         _debug("could not score baseline")
         return baseline
 
+    fast_scorer = _build_fast_scorer(benchmark, plc) if _env_bool("OURS_ANALYTICAL_FAST_SELECT", "0") else None
+    if fast_scorer is not None:
+        try:
+            best_select_cost = float(fast_scorer.score(best)["proxy_cost"])
+        except Exception:
+            fast_scorer = None
+            best_select_cost = best_cost
+    else:
+        best_select_cost = best_cost
+
     steps = _env_int("OURS_ANALYTICAL_STEPS", 800)
     if steps <= 0:
         return baseline
@@ -91,22 +101,57 @@ def refine_with_analytical(
                 continue
             if _env_bool("OURS_ANALYTICAL_SOFT_REFINE", "0"):
                 candidate = _refine_soft(candidate, benchmark, config, grid=grid)
-            costs = compute_proxy_cost(candidate, benchmark, plc)
+            costs = (
+                fast_scorer.score(candidate)
+                if fast_scorer is not None
+                else compute_proxy_cost(candidate, benchmark, plc)
+            )
             if int(costs.get("overlap_count", 1)) != 0:
                 _debug(f"{name}: overlap_count={costs.get('overlap_count')}")
                 continue
             cost = float(costs["proxy_cost"])
-            _debug(f"{name}: proxy={cost:.6f} best={best_cost:.6f}")
-            if cost < best_cost:
-                best_cost = cost
+            label = "fast" if fast_scorer is not None else "proxy"
+            _debug(f"{name}: {label}={cost:.6f} best_select={best_select_cost:.6f}")
+            if cost < best_select_cost:
+                best_select_cost = cost
                 best = candidate.detach().clone().float()
                 best_name = name
         except Exception as exc:
             _debug(f"{name}: failed: {type(exc).__name__}")
             continue
 
+    if fast_scorer is not None and not torch.allclose(best, baseline, atol=1e-7, rtol=0.0):
+        try:
+            exact = compute_proxy_cost(best, benchmark, plc)
+        except Exception:
+            return baseline
+        if int(exact.get("overlap_count", 1)) != 0:
+            return baseline
+        exact_cost = float(exact["proxy_cost"])
+        _debug(
+            f"fast-selected={best_name} exact={exact_cost:.6f} "
+            f"baseline={best_cost:.6f} fast={best_select_cost:.6f}"
+        )
+        if exact_cost < best_cost:
+            return best
+        _debug("fast-selected candidate rejected by exact score")
+        return baseline
+
+    if fast_scorer is None:
+        best_cost = best_select_cost
     _debug(f"selected={best_name} proxy={best_cost:.6f}")
     return best
+
+
+def _build_fast_scorer(benchmark: Benchmark, plc):
+    try:
+        from fast_proxy import build_fast_proxy
+    except Exception:
+        return None
+    try:
+        return build_fast_proxy(benchmark, plc)
+    except Exception:
+        return None
 
 
 def _configs() -> list[tuple[str, _Config]]:
