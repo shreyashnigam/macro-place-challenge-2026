@@ -56,6 +56,18 @@ class ValidityFirstPlacer:
             else None
         )
         selected = _select_by_fast_score(candidates, benchmark, selector_data, eps=self.selector_eps)
+        if _env_bool("OURS_PIPELINE_PORTFOLIO", "0") and len(candidates) > 1:
+            portfolio = self._try_pipeline_portfolio(
+                candidates,
+                benchmark,
+                selector_data,
+                selected,
+            )
+            if portfolio is not None:
+                return portfolio
+        return self._refine_selected(selected, benchmark)
+
+    def _refine_selected(self, selected: torch.Tensor, benchmark: Benchmark) -> torch.Tensor:
         if _env_bool("OURS_BATCH_ANALYTICAL", "0"):
             selected = _try_batch_analytical_refine(selected, benchmark)
         if _env_bool("OURS_ANALYTICAL", "1"):
@@ -73,6 +85,51 @@ class ValidityFirstPlacer:
         if _env_bool("OURS_REPLACE", "0"):
             selected = _try_replace_refine(selected, benchmark)
         return selected
+
+    def _try_pipeline_portfolio(
+        self,
+        candidates: list[tuple[str, torch.Tensor]],
+        benchmark: Benchmark,
+        selector_data: dict[str, torch.Tensor] | None,
+        selected: torch.Tensor,
+    ) -> torch.Tensor | None:
+        plc = _load_plc(benchmark)
+        if plc is None:
+            return None
+        try:
+            from macro_place.objective import compute_proxy_cost
+        except Exception:
+            return None
+
+        limit = max(1, _env_int("OURS_PIPELINE_PORTFOLIO_CANDIDATES", 3))
+        seeds = _pipeline_seed_candidates(
+            candidates,
+            benchmark,
+            selector_data,
+            selected=selected,
+            limit=limit,
+        )
+        if not seeds:
+            return None
+
+        best: torch.Tensor | None = None
+        best_cost = float("inf")
+        for _, seed in seeds:
+            refined = self._refine_selected(seed.detach().clone().float(), benchmark)
+            if not _is_strictly_valid(refined, benchmark):
+                continue
+            try:
+                costs = compute_proxy_cost(refined.detach().float(), benchmark, plc)
+            except Exception:
+                continue
+            if int(costs.get("overlap_count", 1)) != 0:
+                continue
+            cost = float(costs["proxy_cost"])
+            if cost < best_cost:
+                best = refined.detach().clone().float()
+                best_cost = cost
+
+        return best
 
     def generate_candidates(self, benchmark: Benchmark) -> list[tuple[str, torch.Tensor]]:
         candidates: list[tuple[str, torch.Tensor]] = []
@@ -779,6 +836,41 @@ def _single_overlaps(
     overlaps = (dx < hw + hw[idx] + gap) & (dy < hh + hh[idx] + gap)
     overlaps[idx] = False
     return bool(overlaps.any())
+
+
+def _pipeline_seed_candidates(
+    candidates: list[tuple[str, torch.Tensor]],
+    benchmark: Benchmark,
+    data: dict[str, torch.Tensor] | None,
+    *,
+    selected: torch.Tensor,
+    limit: int,
+) -> list[tuple[str, torch.Tensor]]:
+    scored = [
+        (
+            _fast_surrogate_score(placement, benchmark, data),
+            _candidate_preference(name),
+            name,
+            placement,
+        )
+        for name, placement in candidates
+    ]
+    scored.sort(key=lambda item: (item[0], item[1]))
+
+    ordered: list[tuple[str, torch.Tensor]] = [("selected", selected)]
+    ordered.extend((name, placement) for _, _, name, placement in scored)
+
+    if _env_bool("OURS_PIPELINE_PORTFOLIO_INCLUDE_IDENTITY", "1"):
+        ordered.extend((name, placement) for name, placement in candidates if name == "mirror:identity")
+
+    out: list[tuple[str, torch.Tensor]] = []
+    for name, placement in ordered:
+        if any(torch.allclose(placement, existing, atol=1e-5, rtol=0.0) for _, existing in out):
+            continue
+        out.append((name, placement))
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _select_by_fast_score(
