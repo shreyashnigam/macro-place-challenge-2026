@@ -26,6 +26,17 @@ def refine_with_soft_search(
     load_plc: Callable[[Benchmark], object | None],
     is_valid: Callable[[torch.Tensor, Benchmark], bool],
 ) -> torch.Tensor:
+    if (
+        _env_bool("OURS_SOFT_SEARCH_PORTFOLIO", "0")
+        and os.environ.get("_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE") != "1"
+    ):
+        return _refine_with_soft_search_portfolio(
+            baseline,
+            benchmark,
+            load_plc=load_plc,
+            is_valid=is_valid,
+        )
+
     plc = load_plc(benchmark)
     if plc is None:
         return baseline
@@ -235,6 +246,83 @@ def refine_with_soft_search(
         f"fast={best_fast:.6f} accepted={accepted} trials={total_trials}"
     )
     return baseline
+
+
+def _refine_with_soft_search_portfolio(
+    baseline: torch.Tensor,
+    benchmark: Benchmark,
+    *,
+    load_plc: Callable[[Benchmark], object | None],
+    is_valid: Callable[[torch.Tensor, Benchmark], bool],
+) -> torch.Tensor:
+    plc = load_plc(benchmark)
+    if plc is None:
+        return baseline
+    try:
+        base_costs = compute_proxy_cost(baseline.detach().float(), benchmark, plc)
+    except Exception:
+        return baseline
+    if int(base_costs.get("overlap_count", 1)) != 0:
+        return baseline
+
+    best = baseline.detach().clone().float()
+    best_cost = float(base_costs["proxy_cost"])
+    eps = _env_float("OURS_SOFT_SEARCH_EPS", 1e-6)
+    base_seed = _env_int("OURS_SOFT_SEARCH_SEED", 20260519)
+    modes = _env("OURS_SOFT_SEARCH_PORTFOLIO_MODES", "single,bulk")
+    parsed_modes = [mode.strip().lower() for mode in modes.split(",") if mode.strip()]
+    if not parsed_modes:
+        parsed_modes = ["single", "bulk"]
+
+    old_active = os.environ.get("_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE")
+    old_bulk = os.environ.get("OURS_SOFT_SEARCH_BULK")
+    old_seed = os.environ.get("OURS_SOFT_SEARCH_SEED")
+    os.environ["_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE"] = "1"
+    try:
+        for mode_idx, mode in enumerate(parsed_modes):
+            if mode in {"single", "solo", "greedy"}:
+                os.environ["OURS_SOFT_SEARCH_BULK"] = "0"
+            elif mode in {"bulk", "batch"}:
+                os.environ["OURS_SOFT_SEARCH_BULK"] = "1"
+            else:
+                continue
+            os.environ["OURS_SOFT_SEARCH_SEED"] = str(base_seed + 1009 * mode_idx)
+            candidate = refine_with_soft_search(
+                baseline,
+                benchmark,
+                load_plc=load_plc,
+                is_valid=is_valid,
+            )
+            if torch.allclose(candidate, baseline, atol=1e-7, rtol=0.0):
+                continue
+            if not is_valid(candidate, benchmark):
+                continue
+            try:
+                costs = compute_proxy_cost(candidate.detach().float(), benchmark, plc)
+            except Exception:
+                continue
+            if int(costs.get("overlap_count", 1)) != 0:
+                continue
+            cost = float(costs["proxy_cost"])
+            if cost < best_cost - eps:
+                best = candidate.detach().clone().float()
+                best_cost = cost
+                _debug(f"portfolio mode={mode} exact={best_cost:.6f}")
+    finally:
+        if old_active is None:
+            os.environ.pop("_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE", None)
+        else:
+            os.environ["_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE"] = old_active
+        if old_bulk is None:
+            os.environ.pop("OURS_SOFT_SEARCH_BULK", None)
+        else:
+            os.environ["OURS_SOFT_SEARCH_BULK"] = old_bulk
+        if old_seed is None:
+            os.environ.pop("OURS_SOFT_SEARCH_SEED", None)
+        else:
+            os.environ["OURS_SOFT_SEARCH_SEED"] = old_seed
+
+    return best
 
 
 def _build_node_nets(benchmark: Benchmark) -> tuple[list[list[int]], list[list[int]]]:
