@@ -86,6 +86,7 @@ def refine_with_soft_search(
     accepted = 0
     exact_guard = _env_bool("OURS_SOFT_SEARCH_EXACT_GUARD", "1")
     exact_stride = max(0, _env_int("OURS_SOFT_SEARCH_EXACT_STRIDE", 0))
+    bulk_exact_topk = max(0, _env_int("OURS_SOFT_SEARCH_BULK_EXACT_TOPK", 0))
     base_exact_cost: float | None = None
     best_exact_cost: float | None = None
     best_exact: torch.Tensor | None = None
@@ -126,6 +127,34 @@ def refine_with_soft_search(
             )
         last_exact_accept = accepted
 
+    def accept_exact_candidate(cand: np.ndarray, fast_cost: float, label: str) -> bool:
+        nonlocal current, best_fast, best_exact_cost, best_exact, accepted, last_exact_accept
+        if not exact_guard:
+            return False
+        candidate = torch.tensor(cand, dtype=baseline.dtype)
+        if not is_valid(candidate, benchmark):
+            return False
+        try:
+            cand_exact = compute_proxy_cost(candidate.detach().float(), benchmark, plc)
+        except Exception:
+            return False
+        if int(cand_exact.get("overlap_count", 1)) != 0:
+            return False
+        cand_cost = float(cand_exact["proxy_cost"])
+        if best_exact_cost is None or cand_cost < best_exact_cost - eps:
+            current = cand.copy()
+            best_fast = min(best_fast, float(fast_cost))
+            best_exact_cost = cand_cost
+            best_exact = candidate.detach().clone().float()
+            accepted += 1
+            last_exact_accept = accepted
+            _debug(
+                f"exact-rescue {label} exact={cand_cost:.6f} "
+                f"fast={fast_cost:.6f} accepted={accepted} trials={total_trials}"
+            )
+            return True
+        return False
+
     for round_idx in range(rounds):
         try:
             maps = scorer.score(current, maps=True)
@@ -147,6 +176,7 @@ def refine_with_soft_search(
         round_improved = False
 
         if _env_bool("OURS_SOFT_SEARCH_BULK", "0"):
+            bulk_scored: list[tuple[float, np.ndarray]] = []
             for cand in _bulk_candidates(
                 current,
                 benchmark,
@@ -166,6 +196,8 @@ def refine_with_soft_search(
                 if int(score.get("overlap_count", 1)) != 0:
                     continue
                 cost = float(score["proxy_cost"])
+                if bulk_exact_topk > 0 and exact_guard:
+                    bulk_scored.append((cost, cand))
                 if cost + eps < best_fast:
                     current = cand
                     best_fast = cost
@@ -173,6 +205,11 @@ def refine_with_soft_search(
                     round_improved = True
                     if exact_stride > 0 and accepted - last_exact_accept >= exact_stride:
                         checkpoint_exact(f"accepted:{accepted}")
+            if bulk_exact_topk > 0 and bulk_scored:
+                bulk_scored.sort(key=lambda item: item[0])
+                for exact_idx, (cost, cand) in enumerate(bulk_scored[:bulk_exact_topk]):
+                    if accept_exact_candidate(cand, cost, f"bulk:{round_idx}:{exact_idx}"):
+                        round_improved = True
 
         for macro_idx in ranked[:macro_count]:
             proposals = _proposal_points(
