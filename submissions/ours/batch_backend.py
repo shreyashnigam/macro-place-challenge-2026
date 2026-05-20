@@ -178,39 +178,57 @@ def refine_with_batch_analytical(
 
     best = baseline.detach().clone().float()
     best_fast = float(scorer.score(best)["proxy_cost"])
-    checked = 0
-    for snap in snapshots:
+    ranked_candidates: list[tuple[float, int, int, torch.Tensor]] = []
+    overlap_penalty = _env_float("OURS_BATCH_PREFILTER_OVERLAP_PENALTY", 0.03)
+    for snap_idx, snap in enumerate(snapshots):
         for k in range(snap.shape[0]):
             candidate = snap[k].detach().clone().float()
-            candidate = _spiral_legalize_hard(
-                candidate,
-                benchmark,
-                gap=_env_float("OURS_BATCH_GAP", _env_float("OURS_GAP", 0.005)),
-            )
-            try:
-                candidate = legalize_hard(
-                    candidate,
-                    benchmark,
-                    gap=_env_float("OURS_BATCH_GAP", _env_float("OURS_GAP", 0.005)),
-                    max_rounds=_env_int("OURS_BATCH_LEGALIZE_ROUNDS", 500),
-                )
-            except TypeError:
-                candidate = legalize_hard(candidate, benchmark)
-            if not is_valid(candidate, benchmark):
-                continue
-            checked += 1
             try:
                 score = scorer.score(candidate)
             except Exception:
                 continue
-            if int(score.get("overlap_count", 1)) != 0:
-                continue
-            cost = float(score["proxy_cost"])
-            if cost < best_fast:
-                best_fast = cost
-                best = candidate
+            penalized = float(score["proxy_cost"]) + overlap_penalty * float(
+                score.get("overlap_count", 0)
+            )
+            ranked_candidates.append((penalized, snap_idx, k, candidate))
+    ranked_candidates.sort(key=lambda item: item[0])
 
-    _debug(f"checked={checked} best_fast={best_fast:.6f} base_exact={base_cost:.6f}")
+    eval_topk = max(1, _env_int("OURS_BATCH_EVAL_TOPK", 8))
+    checked = 0
+    for _, _, _, candidate_in in ranked_candidates[:eval_topk]:
+        candidate = candidate_in.detach().clone().float()
+        candidate = _spiral_legalize_hard(
+            candidate,
+            benchmark,
+            gap=_env_float("OURS_BATCH_GAP", _env_float("OURS_GAP", 0.005)),
+        )
+        try:
+            candidate = legalize_hard(
+                candidate,
+                benchmark,
+                gap=_env_float("OURS_BATCH_GAP", _env_float("OURS_GAP", 0.005)),
+                max_rounds=_env_int("OURS_BATCH_LEGALIZE_ROUNDS", 500),
+            )
+        except TypeError:
+            candidate = legalize_hard(candidate, benchmark)
+        if not is_valid(candidate, benchmark):
+            continue
+        checked += 1
+        try:
+            score = scorer.score(candidate)
+        except Exception:
+            continue
+        if int(score.get("overlap_count", 1)) != 0:
+            continue
+        cost = float(score["proxy_cost"])
+        if cost < best_fast:
+            best_fast = cost
+            best = candidate
+
+    _debug(
+        f"prefiltered={len(ranked_candidates)} eval_topk={eval_topk} "
+        f"checked={checked} best_fast={best_fast:.6f} base_exact={base_cost:.6f}"
+    )
     if torch.allclose(best, baseline, atol=1e-7, rtol=0.0):
         return baseline
 
