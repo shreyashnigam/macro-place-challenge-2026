@@ -74,7 +74,7 @@ def refine_with_soft_search(
         return baseline
 
     rounds = max(1, _env_int("OURS_SOFT_SEARCH_ROUNDS", 6))
-    max_trials = max(0, _env_int("OURS_SOFT_SEARCH_TRIALS", 50000))
+    max_trials = max(0, _env_int("OURS_SOFT_SEARCH_TRIALS", 100000))
     macro_count = max(1, _env_int("OURS_SOFT_SEARCH_MACROS", 2000))
     eps = _env_float("OURS_SOFT_SEARCH_EPS", 1e-6)
     if max_trials <= 0:
