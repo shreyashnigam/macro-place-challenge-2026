@@ -392,14 +392,12 @@ def _portfolio_candidates(
         with ProcessPoolExecutor(max_workers=max_workers) as pool:
             futures = [
                 pool.submit(
-                    _run_portfolio_candidate,
+                    _run_portfolio_candidate_worker,
                     baseline.detach().cpu().float(),
                     benchmark,
                     route,
                     mode,
                     seed,
-                    load_plc=load_plc,
-                    is_valid=is_valid,
                 )
                 for route, mode, seed in tasks
             ]
@@ -429,6 +427,24 @@ def _portfolio_candidates(
         )
         for route, mode, seed in tasks
     ]
+
+
+def _run_portfolio_candidate_worker(
+    baseline: torch.Tensor,
+    benchmark: Benchmark,
+    route: str,
+    mode: str,
+    seed: int,
+) -> torch.Tensor:
+    return _run_portfolio_candidate(
+        baseline,
+        benchmark,
+        route,
+        mode,
+        seed,
+        load_plc=_load_plc_for_worker,
+        is_valid=_is_valid_for_worker,
+    )
 
 
 def _run_portfolio_candidate(
@@ -479,6 +495,56 @@ def _run_portfolio_candidate(
             os.environ.pop("OURS_SOFT_SEARCH_ROUTE_WEIGHT", None)
         else:
             os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = old_route
+
+
+def _load_plc_for_worker(benchmark: Benchmark):
+    try:
+        from macro_place.loader import load_benchmark, load_benchmark_from_dir
+    except Exception:
+        return None
+
+    name = str(benchmark.name)
+    ibm_dir = Path("external/MacroPlacement/Testcases/ICCAD04") / name
+    if (ibm_dir / "netlist.pb.txt").exists():
+        try:
+            _, plc = load_benchmark_from_dir(str(ibm_dir))
+            return plc
+        except Exception:
+            return None
+
+    aliases = {
+        "ariane133_ng45": "ariane133",
+        "ariane136_ng45": "ariane136",
+        "mempool_tile_ng45": "mempool_tile",
+        "nvdla_ng45": "nvdla",
+    }
+    base_name = aliases.get(name, name.replace("_ng45", "").replace("_asap7", ""))
+    ng45 = (
+        Path("external/MacroPlacement/Flows/NanGate45")
+        / base_name
+        / "netlist"
+        / "output_CT_Grouping"
+    )
+    if (ng45 / "netlist.pb.txt").exists():
+        try:
+            _, plc = load_benchmark(
+                str(ng45 / "netlist.pb.txt"),
+                str(ng45 / "initial.plc"),
+                name=name,
+            )
+            return plc
+        except Exception:
+            return None
+    return None
+
+
+def _is_valid_for_worker(placement: torch.Tensor, benchmark: Benchmark) -> bool:
+    try:
+        from macro_place.utils import validate_placement
+
+        return bool(validate_placement(placement, benchmark)[0])
+    except Exception:
+        return False
 
 
 def _build_node_nets(benchmark: Benchmark) -> tuple[list[list[int]], list[list[int]]]:
