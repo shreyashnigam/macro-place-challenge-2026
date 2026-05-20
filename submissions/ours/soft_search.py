@@ -340,7 +340,9 @@ def _refine_with_soft_sa(
     n_all = int(benchmark.num_macros)
     fixed = benchmark.macro_fixed.detach().cpu().numpy().astype(bool, copy=False)
     soft_indices = np.asarray([i for i in range(n_hard, n_all) if not fixed[i]], dtype=np.int32)
-    if soft_indices.size == 0:
+    hard_indices = np.asarray([i for i in range(n_hard) if not fixed[i]], dtype=np.int32)
+    hard_prob = min(1.0, max(0.0, _env_float("OURS_SOFT_SEARCH_SA_HARD_PROB", 0.0)))
+    if soft_indices.size == 0 and (hard_indices.size == 0 or hard_prob <= 0.0):
         return baseline
 
     eps = _env_float("OURS_SOFT_SEARCH_EPS", 1e-6)
@@ -375,9 +377,11 @@ def _refine_with_soft_sa(
     cold_prob = min(1.0, max(0.0, _env_float("OURS_SOFT_SEARCH_SA_COLD_PROB", 0.25)))
 
     ranked = list(int(i) for i in soft_indices[:pool_size])
+    hard_ranked = list(int(i) for i in hard_indices[:pool_size])
     pressure = np.zeros((int(benchmark.grid_rows), int(benchmark.grid_cols)), dtype=np.float64)
     cold: list[np.ndarray] = []
     route_weight = 0.0
+    hard_gap = _env_float("OURS_SOFT_SEARCH_SA_HARD_GAP", _env_float("OURS_GAP", 0.005))
 
     started = time.monotonic()
     accepted = 0
@@ -388,41 +392,62 @@ def _refine_with_soft_sa(
         return timeout > 0.0 and time.monotonic() - started >= timeout
 
     def refresh_rank() -> None:
-        nonlocal ranked, pressure, cold, route_weight
+        nonlocal ranked, hard_ranked, pressure, cold, route_weight
         try:
             maps = scorer.score(current, maps=True)
             pressure = _pressure_map(maps, benchmark)
             route_weight = _soft_route_weight(maps)
-            ranked = _rank_soft_macros(
+            if soft_indices.size > 0:
+                ranked = _rank_soft_macros(
+                    current,
+                    benchmark,
+                    soft_indices,
+                    node_nets,
+                    nets,
+                    pressure,
+                    route_weight=route_weight,
+                )[: min(pool_size, len(soft_indices))]
+            else:
+                ranked = []
+            hard_ranked = _rank_hard_macros_for_sa(
                 current,
                 benchmark,
-                soft_indices,
-                node_nets,
-                nets,
+                scorer,
                 pressure,
-                route_weight=route_weight,
-            )[: min(pool_size, len(soft_indices))]
+                hard_indices,
+            )[: min(pool_size, len(hard_indices))]
             cold = _cold_centers(pressure, benchmark)
         except Exception:
             ranked = list(int(i) for i in soft_indices[:pool_size])
+            hard_ranked = list(int(i) for i in hard_indices[:pool_size])
             pressure = np.zeros((int(benchmark.grid_rows), int(benchmark.grid_cols)), dtype=np.float64)
             cold = []
             route_weight = 0.0
 
     refresh_rank()
-    if not ranked:
+    if not ranked and (hard_prob <= 0.0 or not hard_ranked):
         return baseline
 
     while total < max_trials and not timed_out():
         if total > 0 and total % rank_period == 0:
             refresh_rank()
-            if not ranked:
+            if not ranked and (hard_prob <= 0.0 or not hard_ranked):
                 break
 
         frac = float(total) / max(1.0, float(max_trials - 1))
         temp = temp0 * ((temp1 / temp0) ** frac)
         move_max = move_max0 * ((move_max1 / max(move_max0, 1e-12)) ** frac)
-        idx = int(ranked[int(rng.integers(0, len(ranked)))])
+        choose_hard = (
+            hard_prob > 0.0
+            and hard_ranked
+            and (not ranked or float(rng.random()) < hard_prob)
+        )
+        if choose_hard:
+            idx = int(hard_ranked[int(rng.integers(0, len(hard_ranked)))])
+        else:
+            if not ranked:
+                break
+            idx = int(ranked[int(rng.integers(0, len(ranked)))])
         old = current[idx].copy()
 
         roll = float(rng.random())
@@ -454,7 +479,19 @@ def _refine_with_soft_sa(
             mag = move_min + float(rng.random()) * max(0.0, move_max - move_min)
             point = old + np.asarray([math.cos(angle) * mag, math.sin(angle) * mag], dtype=np.float64)
 
-        current[idx] = _clamp_point(point, benchmark, idx)
+        new_point = _clamp_point(point, benchmark, idx)
+        if choose_hard and not _single_hard_move_valid_np(
+            current,
+            benchmark,
+            idx,
+            float(new_point[0]),
+            float(new_point[1]),
+            gap=hard_gap,
+        ):
+            total += 1
+            continue
+
+        current[idx] = new_point
         total += 1
         try:
             score = scorer.score(current)
@@ -1340,6 +1377,106 @@ def _point_cell(
     col = min(cols - 1, max(0, int(float(x) / max(bin_w, 1e-12))))
     row = min(rows - 1, max(0, int(float(y) / max(bin_h, 1e-12))))
     return row, col
+
+
+def _rank_hard_macros_for_sa(
+    placement: np.ndarray,
+    benchmark: Benchmark,
+    scorer,
+    pressure: np.ndarray,
+    hard_indices: np.ndarray,
+) -> list[int]:
+    if hard_indices.size == 0 or pressure.size == 0:
+        return [int(i) for i in hard_indices.tolist()]
+    flat = pressure.reshape(-1)
+    sizes = benchmark.macro_sizes.detach().cpu().numpy().astype(np.float64, copy=False)
+    ranked: list[tuple[float, int]] = []
+    for idx_raw in hard_indices:
+        idx = int(idx_raw)
+        bins = _covered_grid_bins(
+            scorer,
+            float(placement[idx, 0]),
+            float(placement[idx, 1]),
+            float(sizes[idx, 0]),
+            float(sizes[idx, 1]),
+        )
+        if not bins:
+            row, col = _point_cell(
+                float(placement[idx, 0]),
+                float(placement[idx, 1]),
+                scorer.grid_width,
+                scorer.grid_height,
+                scorer.grid_rows,
+                scorer.grid_cols,
+            )
+            bins = [row * scorer.grid_cols + col]
+        vals = flat[np.asarray(bins, dtype=np.int64)]
+        area = float(sizes[idx, 0] * sizes[idx, 1])
+        score = float(vals.max()) + 0.35 * float(vals.mean()) + 0.02 * math.log1p(area)
+        ranked.append((score, idx))
+    ranked.sort(reverse=True)
+    return [idx for _, idx in ranked]
+
+
+def _covered_grid_bins(
+    scorer,
+    x: float,
+    y: float,
+    w: float,
+    h: float,
+) -> list[int]:
+    x_min = float(x) - 0.5 * float(w)
+    x_max = float(x) + 0.5 * float(w)
+    y_min = float(y) - 0.5 * float(h)
+    y_max = float(y) + 0.5 * float(h)
+    bl_row, bl_col = _point_cell(
+        x_min,
+        y_min,
+        scorer.grid_width,
+        scorer.grid_height,
+        scorer.grid_rows,
+        scorer.grid_cols,
+    )
+    ur_row, ur_col = _point_cell(
+        x_max,
+        y_max,
+        scorer.grid_width,
+        scorer.grid_height,
+        scorer.grid_rows,
+        scorer.grid_cols,
+    )
+    return [
+        row * scorer.grid_cols + col
+        for row in range(bl_row, ur_row + 1)
+        for col in range(bl_col, ur_col + 1)
+    ]
+
+
+def _single_hard_move_valid_np(
+    placement: np.ndarray,
+    benchmark: Benchmark,
+    idx: int,
+    x: float,
+    y: float,
+    *,
+    gap: float,
+) -> bool:
+    n_hard = int(benchmark.num_hard_macros)
+    sizes = benchmark.macro_sizes[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    half_w = 0.5 * sizes[:, 0]
+    half_h = 0.5 * sizes[:, 1]
+    if x < half_w[idx] + gap or x > float(benchmark.canvas_width) - half_w[idx] - gap:
+        return False
+    if y < half_h[idx] + gap or y > float(benchmark.canvas_height) - half_h[idx] - gap:
+        return False
+    pos = placement[:n_hard]
+    dx = np.abs(pos[:, 0] - float(x))
+    dy = np.abs(pos[:, 1] - float(y))
+    sep_x = half_w + half_w[idx] + gap
+    sep_y = half_h + half_h[idx] + gap
+    overlaps = (dx < sep_x) & (dy < sep_y)
+    overlaps[idx] = False
+    return not bool(np.any(overlaps))
 
 
 def _clamp_point(point: np.ndarray, benchmark: Benchmark, macro_idx: int) -> np.ndarray:
