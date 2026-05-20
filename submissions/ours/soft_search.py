@@ -7,7 +7,7 @@ guarded by the official proxy evaluator before it replaces the input placement.
 
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 import multiprocessing as mp
 import os
 from pathlib import Path
@@ -458,6 +458,9 @@ def _portfolio_candidates(
 
     max_workers = min(workers, len(tasks))
     results: list[tuple[str, str, float, torch.Tensor]] = []
+    timed_out = False
+    failed_parallel = False
+    pool: ProcessPoolExecutor | None = None
     try:
         baseline_np = baseline.detach().cpu().float().numpy().copy()
         benchmark_name = str(benchmark.name)
@@ -468,21 +471,33 @@ def _portfolio_candidates(
                 pool_kwargs["mp_context"] = mp.get_context(start_method)
             except ValueError:
                 _debug(f"unsupported multiprocessing start={start_method!r}; using default")
-        with ProcessPoolExecutor(max_workers=max_workers, **pool_kwargs) as pool:
-            futures = [
-                pool.submit(
-                    _run_portfolio_candidate_worker,
-                    baseline_np,
-                    benchmark_name,
-                    route,
-                    mode,
-                    density_weight,
-                    seed,
-                )
-                for route, mode, density_weight, seed in tasks
-            ]
-            route_modes = [(route, mode, density_weight) for route, mode, density_weight, _ in tasks]
-            for future, (route, mode, density_weight) in zip(futures, route_modes):
+        pool = ProcessPoolExecutor(max_workers=max_workers, **pool_kwargs)
+        future_meta = {
+            pool.submit(
+                _run_portfolio_candidate_worker,
+                baseline_np,
+                benchmark_name,
+                route,
+                mode,
+                density_weight,
+                seed,
+            ): (route, mode, density_weight)
+            for route, mode, density_weight, seed in tasks
+        }
+        pending = set(future_meta)
+        timeout = max(0.0, _env_float("OURS_SOFT_SEARCH_PORTFOLIO_TIMEOUT", 3000.0))
+        deadline = time.monotonic() + timeout if timeout > 0.0 else None
+        while pending:
+            wait_timeout = None
+            if deadline is not None:
+                wait_timeout = max(0.0, deadline - time.monotonic())
+            done, pending = wait(pending, timeout=wait_timeout, return_when=FIRST_COMPLETED)
+            if not done:
+                timed_out = True
+                _debug(f"portfolio collection timeout results={len(results)} tasks={len(tasks)}")
+                break
+            for future in done:
+                route, mode, density_weight = future_meta[future]
                 try:
                     results.append((route, mode, density_weight, future.result()))
                 except Exception as exc:
@@ -494,11 +509,24 @@ def _portfolio_candidates(
                     continue
     except Exception as exc:
         _debug(f"portfolio parallel failed: {type(exc).__name__}: {exc}")
-        results = []
+        failed_parallel = True
+    finally:
+        if pool is not None:
+            if timed_out:
+                for future in pending:
+                    future.cancel()
+                pool.shutdown(wait=False, cancel_futures=True)
+            else:
+                pool.shutdown(wait=True, cancel_futures=True)
     if results:
         if len(results) != len(tasks):
             _debug(f"portfolio partial results={len(results)} tasks={len(tasks)}; keeping partial")
         return results
+    if timed_out:
+        _debug(f"portfolio timed out with no completed results tasks={len(tasks)}")
+        return []
+    if not failed_parallel:
+        return []
     _debug(f"portfolio falling back to serial tasks={len(tasks)}")
     return [
         (
