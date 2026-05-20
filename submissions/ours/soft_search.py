@@ -86,7 +86,7 @@ def refine_with_soft_search(
     accepted = 0
     exact_guard = _env_bool("OURS_SOFT_SEARCH_EXACT_GUARD", "1")
     exact_stride = max(0, _env_int("OURS_SOFT_SEARCH_EXACT_STRIDE", 0))
-    bulk_exact_topk = max(0, _env_int("OURS_SOFT_SEARCH_BULK_EXACT_TOPK", 0))
+    bulk_exact_topk = max(0, _env_int("OURS_SOFT_SEARCH_BULK_EXACT_TOPK", 4))
     base_exact_cost: float | None = None
     best_exact_cost: float | None = None
     best_exact: torch.Tensor | None = None
@@ -321,7 +321,7 @@ def _refine_with_soft_search_portfolio(
     parsed_modes = [mode.strip().lower() for mode in modes.split(",") if mode.strip()]
     if not parsed_modes:
         parsed_modes = ["bulk"]
-    routes = _env("OURS_SOFT_SEARCH_PORTFOLIO_ROUTES", "auto,3.00,0.00,0.25,0.50")
+    routes = _env("OURS_SOFT_SEARCH_PORTFOLIO_ROUTES", "auto,0.00,0.25,0.50,3.00,5.00,8.00")
     parsed_routes = [route.strip().lower() for route in routes.split(",") if route.strip()]
     if not parsed_routes:
         parsed_routes = ["auto"]
@@ -424,7 +424,7 @@ def _portfolio_candidates(
     load_plc: Callable[[Benchmark], object | None],
     is_valid: Callable[[torch.Tensor, Benchmark], bool],
 ) -> list[tuple[str, str, float, torch.Tensor]]:
-    workers = max(1, _env_int("OURS_SOFT_SEARCH_PORTFOLIO_WORKERS", min(10, len(tasks))))
+    workers = max(1, _env_int("OURS_SOFT_SEARCH_PORTFOLIO_WORKERS", min(14, len(tasks))))
     if workers <= 1 or len(tasks) <= 1:
         return [
             (
