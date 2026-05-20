@@ -495,12 +495,11 @@ def _portfolio_candidates(
     except Exception as exc:
         _debug(f"portfolio parallel failed: {type(exc).__name__}: {exc}")
         results = []
-    if len(results) == len(tasks):
-        return results
     if results:
-        _debug(f"portfolio incomplete results={len(results)} tasks={len(tasks)}; falling back to serial")
-    else:
-        _debug(f"portfolio falling back to serial tasks={len(tasks)}")
+        if len(results) != len(tasks):
+            _debug(f"portfolio partial results={len(results)} tasks={len(tasks)}; keeping partial")
+        return results
+    _debug(f"portfolio falling back to serial tasks={len(tasks)}")
     return [
         (
             route,
