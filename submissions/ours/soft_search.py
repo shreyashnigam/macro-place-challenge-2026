@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import sys
 import math
+import time
 from typing import Callable
 
 import numpy as np
@@ -77,6 +78,8 @@ def refine_with_soft_search(
     max_trials = max(0, _env_int("OURS_SOFT_SEARCH_TRIALS", 100000))
     macro_count = max(1, _env_int("OURS_SOFT_SEARCH_MACROS", 2000))
     eps = _env_float("OURS_SOFT_SEARCH_EPS", 1e-6)
+    search_started = time.monotonic()
+    timeout = max(0.0, _env_float("OURS_SOFT_SEARCH_TIMEOUT", 3200.0))
     if max_trials <= 0:
         return baseline
 
@@ -103,6 +106,9 @@ def refine_with_soft_search(
         base_exact_cost = float(base_exact["proxy_cost"])
         best_exact_cost = base_exact_cost
         best_exact = baseline.detach().clone().float()
+
+    def timed_out() -> bool:
+        return timeout > 0.0 and time.monotonic() - search_started >= timeout
 
     def checkpoint_exact(label: str) -> None:
         nonlocal best_exact_cost, best_exact, last_exact_accept
@@ -156,6 +162,9 @@ def refine_with_soft_search(
         return False
 
     for round_idx in range(rounds):
+        if timed_out():
+            _debug(f"timeout before round={round_idx} trials={total_trials} accepted={accepted}")
+            break
         try:
             maps = scorer.score(current, maps=True)
         except Exception:
@@ -186,7 +195,7 @@ def refine_with_soft_search(
                 cold,
                 round_idx,
             ):
-                if total_trials >= max_trials:
+                if total_trials >= max_trials or timed_out():
                     break
                 total_trials += 1
                 try:
@@ -212,6 +221,8 @@ def refine_with_soft_search(
                         round_improved = True
 
         for macro_idx in ranked[:macro_count]:
+            if timed_out():
+                break
             proposals = _proposal_points(
                 current,
                 benchmark,
@@ -223,7 +234,7 @@ def refine_with_soft_search(
                 diag,
             )
             for point in proposals:
-                if total_trials >= max_trials:
+                if total_trials >= max_trials or timed_out():
                     break
                 total_trials += 1
                 cand = current.copy()
@@ -252,7 +263,7 @@ def refine_with_soft_search(
         )
         if round_improved:
             checkpoint_exact(f"round:{round_idx}")
-        if not round_improved or total_trials >= max_trials:
+        if not round_improved or total_trials >= max_trials or timed_out():
             break
 
     if accepted == 0:
