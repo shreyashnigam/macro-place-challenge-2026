@@ -370,7 +370,7 @@ def _portfolio_candidates(
     load_plc: Callable[[Benchmark], object | None],
     is_valid: Callable[[torch.Tensor, Benchmark], bool],
 ) -> list[tuple[str, str, torch.Tensor]]:
-    workers = max(1, _env_int("OURS_SOFT_SEARCH_PORTFOLIO_WORKERS", min(4, len(tasks))))
+    workers = max(1, _env_int("OURS_SOFT_SEARCH_PORTFOLIO_WORKERS", min(5, len(tasks))))
     if workers <= 1 or len(tasks) <= 1:
         return [
             (
