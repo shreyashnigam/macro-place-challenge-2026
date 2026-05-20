@@ -436,7 +436,7 @@ def _soft_route_weight(score_with_maps: dict[str, object]) -> float:
         proxy >= _env_float("OURS_SOFT_SEARCH_ROUTE_MIN_PROXY", 1.20)
         or congestion >= _env_float("OURS_SOFT_SEARCH_ROUTE_MIN_CONG", 1.45)
     ):
-        return _env_float("OURS_SOFT_SEARCH_ROUTE_AUTO_WEIGHT", 0.25)
+        return _env_float("OURS_SOFT_SEARCH_ROUTE_AUTO_WEIGHT", 2.00)
     return 0.0
 
 
