@@ -565,6 +565,18 @@ def _proposal_points(
         y = float(rng.uniform(half_h, max(half_h, ch - half_h)))
         add_target(x, y, legalize=True)
 
+    if _env_int("OURS_FAST_SEARCH_EDGE_SNAPS", 0) > 0:
+        proposals.extend(
+            _edge_snap_points(
+                placement,
+                benchmark,
+                macro_idx,
+                scorer,
+                pressure,
+                gap=gap,
+            )
+        )
+
     dedup: list[tuple[float, float]] = []
     seen: set[tuple[int, int]] = set()
     for x, y in proposals:
@@ -616,6 +628,95 @@ def _legal_point_near(
         if best is not None:
             return best
     return None
+
+
+def _edge_snap_points(
+    placement: torch.Tensor,
+    benchmark: Benchmark,
+    idx: int,
+    scorer,
+    pressure: np.ndarray,
+    *,
+    gap: float,
+) -> list[tuple[float, float]]:
+    """Find legal pockets by aligning a macro with obstacle edges near cool bins."""
+    limit = max(0, _env_int("OURS_FAST_SEARCH_EDGE_SNAPS", 0))
+    if limit <= 0 or pressure.size == 0:
+        return []
+
+    n = int(benchmark.num_hard_macros)
+    pos = placement[:n].detach().cpu().numpy().astype(np.float64, copy=False)
+    sizes = benchmark.macro_sizes[:n].detach().cpu().numpy().astype(np.float64, copy=False)
+    half_w = 0.5 * float(sizes[idx, 0])
+    half_h = 0.5 * float(sizes[idx, 1])
+    cw = float(benchmark.canvas_width)
+    ch = float(benchmark.canvas_height)
+    margin = max(float(gap), 0.0)
+
+    x_lo = half_w + margin
+    x_hi = cw - half_w - margin
+    y_lo = half_h + margin
+    y_hi = ch - half_h - margin
+    if x_lo > x_hi or y_lo > y_hi:
+        return []
+
+    x_candidates = [x_lo, x_hi, float(pos[idx, 0])]
+    y_candidates = [y_lo, y_hi, float(pos[idx, 1])]
+    for j in range(n):
+        if j == idx:
+            continue
+        other_hw = 0.5 * float(sizes[j, 0])
+        other_hh = 0.5 * float(sizes[j, 1])
+        x_candidates.append(float(pos[j, 0]) - other_hw - half_w - margin)
+        x_candidates.append(float(pos[j, 0]) + other_hw + half_w + margin)
+        y_candidates.append(float(pos[j, 1]) - other_hh - half_h - margin)
+        y_candidates.append(float(pos[j, 1]) + other_hh + half_h + margin)
+
+    cold_count = max(1, _env_int("OURS_FAST_SEARCH_EDGE_COLD_BINS", 16))
+    k = min(max(cold_count * 4, cold_count), pressure.size)
+    order = np.argpartition(pressure, k - 1)[:k]
+    order = order[np.argsort(pressure[order])][:cold_count]
+    targets: list[tuple[float, float]] = []
+    for flat in order:
+        rr = int(flat // scorer.grid_cols)
+        cc = int(flat % scorer.grid_cols)
+        tx = (cc + 0.5) * scorer.grid_width
+        ty = (rr + 0.5) * scorer.grid_height
+        tx = _clip(tx, x_lo, x_hi)
+        ty = _clip(ty, y_lo, y_hi)
+        targets.append((tx, ty))
+        x_candidates.append(tx)
+        y_candidates.append(ty)
+
+    axis_limit = max(2, _env_int("OURS_FAST_SEARCH_EDGE_AXIS", 8))
+    scored: list[tuple[float, float, float]] = []
+    seen: set[tuple[int, int]] = set()
+    for tx, ty in targets:
+        xs = sorted(
+            {_clip(x, x_lo, x_hi) for x in x_candidates},
+            key=lambda x: abs(float(x) - tx),
+        )[:axis_limit]
+        ys = sorted(
+            {_clip(y, y_lo, y_hi) for y in y_candidates},
+            key=lambda y: abs(float(y) - ty),
+        )[:axis_limit]
+        for x in xs:
+            for y in ys:
+                key = (int(round(x * 10000.0)), int(round(y * 10000.0)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                if not _single_move_valid(placement, benchmark, idx, float(x), float(y), gap=gap):
+                    continue
+                row, col = scorer._grid_cell(float(x), float(y))
+                p = float(pressure[row * scorer.grid_cols + col])
+                dist = ((float(x) - tx) / max(scorer.grid_width, 1e-9)) ** 2 + (
+                    (float(y) - ty) / max(scorer.grid_height, 1e-9)
+                ) ** 2
+                scored.append((p + 0.025 * dist, float(x), float(y)))
+
+    scored.sort(key=lambda item: item[0])
+    return [(x, y) for _, x, y in scored[:limit]]
 
 
 def _covered_bins(scorer, x: float, y: float, w: float, h: float) -> list[int]:
