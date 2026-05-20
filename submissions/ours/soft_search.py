@@ -283,7 +283,7 @@ def _refine_with_soft_search_portfolio(
     parsed_modes = [mode.strip().lower() for mode in modes.split(",") if mode.strip()]
     if not parsed_modes:
         parsed_modes = ["bulk"]
-    routes = _env("OURS_SOFT_SEARCH_PORTFOLIO_ROUTES", "3.00,0.00,0.25,0.50")
+    routes = _env("OURS_SOFT_SEARCH_PORTFOLIO_ROUTES", "auto,3.00,0.00,0.25,0.50")
     parsed_routes = [route.strip().lower() for route in routes.split(",") if route.strip()]
     if not parsed_routes:
         parsed_routes = ["auto"]
