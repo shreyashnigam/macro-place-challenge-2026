@@ -86,7 +86,7 @@ def refine_with_soft_search(
     accepted = 0
     exact_guard = _env_bool("OURS_SOFT_SEARCH_EXACT_GUARD", "1")
     exact_stride = max(0, _env_int("OURS_SOFT_SEARCH_EXACT_STRIDE", 0))
-    bulk_exact_topk = max(0, _env_int("OURS_SOFT_SEARCH_BULK_EXACT_TOPK", 4))
+    bulk_exact_topk = max(0, _env_int("OURS_SOFT_SEARCH_BULK_EXACT_TOPK", 0))
     base_exact_cost: float | None = None
     best_exact_cost: float | None = None
     best_exact: torch.Tensor | None = None
