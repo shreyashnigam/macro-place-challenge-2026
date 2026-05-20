@@ -288,14 +288,21 @@ def _refine_with_soft_search_portfolio(
     parsed_routes = [route.strip().lower() for route in routes.split(",") if route.strip()]
     if not parsed_routes:
         parsed_routes = ["auto"]
+    density_weights = [
+        max(0.0, float(weight))
+        for weight in _env_float_list("OURS_SOFT_SEARCH_PORTFOLIO_DENSITY_WEIGHTS", [0.0, 0.50])
+    ]
+    if not density_weights:
+        density_weights = [0.0]
 
     old_active = os.environ.get("_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE")
     old_bulk = os.environ.get("OURS_SOFT_SEARCH_BULK")
     old_seed = os.environ.get("OURS_SOFT_SEARCH_SEED")
     old_route = os.environ.get("OURS_SOFT_SEARCH_ROUTE_WEIGHT")
+    old_density = os.environ.get("OURS_SOFT_SEARCH_DENSITY_WEIGHT")
     os.environ["_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE"] = "1"
     try:
-        tasks = _portfolio_tasks(parsed_routes, parsed_modes, base_seed)
+        tasks = _portfolio_tasks(parsed_routes, parsed_modes, density_weights, base_seed)
         candidates = _portfolio_candidates(
             baseline,
             benchmark,
@@ -303,7 +310,7 @@ def _refine_with_soft_search_portfolio(
             load_plc=load_plc,
             is_valid=is_valid,
         )
-        for route, mode, candidate in candidates:
+        for route, mode, density_weight, candidate in candidates:
             if torch.allclose(candidate, baseline, atol=1e-7, rtol=0.0):
                 continue
             if not is_valid(candidate, benchmark):
@@ -318,7 +325,10 @@ def _refine_with_soft_search_portfolio(
             if cost < best_cost - eps:
                 best = candidate.detach().clone().float()
                 best_cost = cost
-                _debug(f"portfolio route={route} mode={mode} exact={best_cost:.6f}")
+                _debug(
+                    f"portfolio route={route} mode={mode} density={density_weight:.3g} "
+                    f"exact={best_cost:.6f}"
+                )
     finally:
         if old_active is None:
             os.environ.pop("_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE", None)
@@ -336,6 +346,10 @@ def _refine_with_soft_search_portfolio(
             os.environ.pop("OURS_SOFT_SEARCH_ROUTE_WEIGHT", None)
         else:
             os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = old_route
+        if old_density is None:
+            os.environ.pop("OURS_SOFT_SEARCH_DENSITY_WEIGHT", None)
+        else:
+            os.environ["OURS_SOFT_SEARCH_DENSITY_WEIGHT"] = old_density
 
     return best
 
@@ -343,9 +357,10 @@ def _refine_with_soft_search_portfolio(
 def _portfolio_tasks(
     parsed_routes: list[str],
     parsed_modes: list[str],
+    density_weights: list[float],
     base_seed: int,
-) -> list[tuple[str, str, int]]:
-    tasks: list[tuple[str, str, int]] = []
+) -> list[tuple[str, str, float, int]]:
+    tasks: list[tuple[str, str, float, int]] = []
     diversify_routes = _env_bool("OURS_SOFT_SEARCH_PORTFOLIO_DIVERSE_SEEDS", "0")
     for route_idx, route in enumerate(parsed_routes):
         if route not in {"auto", "adaptive", "default"}:
@@ -356,41 +371,45 @@ def _portfolio_tasks(
         for mode_idx, mode in enumerate(parsed_modes):
             if mode not in {"single", "solo", "greedy", "bulk", "batch"}:
                 continue
-            route_offset = 104729 * route_idx if diversify_routes else 0
-            seed = base_seed + 1009 * mode_idx + route_offset
-            tasks.append((route, mode, seed))
+            for density_idx, density_weight in enumerate(density_weights):
+                route_offset = 104729 * route_idx if diversify_routes else 0
+                density_offset = 9176 * density_idx
+                seed = base_seed + 1009 * mode_idx + density_offset + route_offset
+                tasks.append((route, mode, float(density_weight), seed))
     return tasks
 
 
 def _portfolio_candidates(
     baseline: torch.Tensor,
     benchmark: Benchmark,
-    tasks: list[tuple[str, str, int]],
+    tasks: list[tuple[str, str, float, int]],
     *,
     load_plc: Callable[[Benchmark], object | None],
     is_valid: Callable[[torch.Tensor, Benchmark], bool],
-) -> list[tuple[str, str, torch.Tensor]]:
-    workers = max(1, _env_int("OURS_SOFT_SEARCH_PORTFOLIO_WORKERS", min(5, len(tasks))))
+) -> list[tuple[str, str, float, torch.Tensor]]:
+    workers = max(1, _env_int("OURS_SOFT_SEARCH_PORTFOLIO_WORKERS", min(10, len(tasks))))
     if workers <= 1 or len(tasks) <= 1:
         return [
             (
                 route,
                 mode,
+                density_weight,
                 _run_portfolio_candidate(
                     baseline,
                     benchmark,
                     route,
                     mode,
+                    density_weight,
                     seed,
                     load_plc=load_plc,
                     is_valid=is_valid,
                 ),
             )
-            for route, mode, seed in tasks
+            for route, mode, density_weight, seed in tasks
         ]
 
     max_workers = min(workers, len(tasks))
-    results: list[tuple[str, str, torch.Tensor]] = []
+    results: list[tuple[str, str, float, torch.Tensor]] = []
     try:
         baseline_np = baseline.detach().cpu().float().numpy().copy()
         benchmark_name = str(benchmark.name)
@@ -409,17 +428,19 @@ def _portfolio_candidates(
                     benchmark_name,
                     route,
                     mode,
+                    density_weight,
                     seed,
                 )
-                for route, mode, seed in tasks
+                for route, mode, density_weight, seed in tasks
             ]
-            route_modes = [(route, mode) for route, mode, _ in tasks]
-            for future, (route, mode) in zip(futures, route_modes):
+            route_modes = [(route, mode, density_weight) for route, mode, density_weight, _ in tasks]
+            for future, (route, mode, density_weight) in zip(futures, route_modes):
                 try:
-                    results.append((route, mode, future.result()))
+                    results.append((route, mode, density_weight, future.result()))
                 except Exception as exc:
                     _debug(
-                        f"portfolio worker route={route} mode={mode} failed: "
+                        f"portfolio worker route={route} mode={mode} "
+                        f"density={density_weight:.3g} failed: "
                         f"{type(exc).__name__}: {exc}"
                     )
                     continue
@@ -436,17 +457,19 @@ def _portfolio_candidates(
         (
             route,
             mode,
+            density_weight,
             _run_portfolio_candidate(
                 baseline,
                 benchmark,
                 route,
                 mode,
+                density_weight,
                 seed,
                 load_plc=load_plc,
                 is_valid=is_valid,
             ),
         )
-        for route, mode, seed in tasks
+        for route, mode, density_weight, seed in tasks
     ]
 
 
@@ -455,6 +478,7 @@ def _run_portfolio_candidate_worker(
     benchmark_name: str,
     route: str,
     mode: str,
+    density_weight: float,
     seed: int,
 ) -> torch.Tensor:
     loaded = _load_benchmark_and_plc_for_worker(benchmark_name)
@@ -470,6 +494,7 @@ def _run_portfolio_candidate_worker(
         benchmark,
         route,
         mode,
+        density_weight,
         seed,
         load_plc=load_plc,
         is_valid=_is_valid_for_worker,
@@ -481,6 +506,7 @@ def _run_portfolio_candidate(
     benchmark: Benchmark,
     route: str,
     mode: str,
+    density_weight: float,
     seed: int,
     *,
     load_plc: Callable[[Benchmark], object | None],
@@ -490,12 +516,14 @@ def _run_portfolio_candidate(
     old_bulk = os.environ.get("OURS_SOFT_SEARCH_BULK")
     old_seed = os.environ.get("OURS_SOFT_SEARCH_SEED")
     old_route = os.environ.get("OURS_SOFT_SEARCH_ROUTE_WEIGHT")
+    old_density = os.environ.get("OURS_SOFT_SEARCH_DENSITY_WEIGHT")
     os.environ["_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE"] = "1"
     try:
         if route in {"auto", "adaptive", "default"}:
             os.environ.pop("OURS_SOFT_SEARCH_ROUTE_WEIGHT", None)
         else:
             os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = str(max(0.0, float(route)))
+        os.environ["OURS_SOFT_SEARCH_DENSITY_WEIGHT"] = str(max(0.0, float(density_weight)))
         if mode in {"single", "solo", "greedy"}:
             os.environ["OURS_SOFT_SEARCH_BULK"] = "0"
         else:
@@ -524,6 +552,10 @@ def _run_portfolio_candidate(
             os.environ.pop("OURS_SOFT_SEARCH_ROUTE_WEIGHT", None)
         else:
             os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = old_route
+        if old_density is None:
+            os.environ.pop("OURS_SOFT_SEARCH_DENSITY_WEIGHT", None)
+        else:
+            os.environ["OURS_SOFT_SEARCH_DENSITY_WEIGHT"] = old_density
 
 
 def _load_benchmark_and_plc_for_worker(benchmark_name: str):
