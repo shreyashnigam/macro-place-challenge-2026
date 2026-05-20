@@ -170,6 +170,7 @@ def refine_with_soft_search(
         except Exception:
             break
         pressure = _pressure_map(maps, benchmark)
+        route_weight = _soft_route_weight(maps)
         ranked = _rank_soft_macros(
             current,
             benchmark,
@@ -177,7 +178,7 @@ def refine_with_soft_search(
             node_nets,
             nets,
             pressure,
-            route_weight=_soft_route_weight(maps),
+            route_weight=route_weight,
         )
         if not ranked:
             break
@@ -193,6 +194,8 @@ def refine_with_soft_search(
                 node_nets,
                 nets,
                 cold,
+                pressure,
+                route_weight,
                 round_idx,
             ):
                 if total_trials >= max_trials or timed_out():
@@ -229,9 +232,11 @@ def refine_with_soft_search(
                 int(macro_idx),
                 node_nets,
                 nets,
+                pressure,
                 cold,
                 rng,
                 diag,
+                route_weight,
             )
             for point in proposals:
                 if total_trials >= max_trials or timed_out():
@@ -859,9 +864,11 @@ def _proposal_points(
     macro_idx: int,
     node_nets: list[list[int]],
     nets: list[list[int]],
+    pressure: np.ndarray,
     cold_centers: list[np.ndarray],
     rng: np.random.Generator,
     diag: float,
+    route_weight: float,
 ) -> list[np.ndarray]:
     current = placement[macro_idx].astype(np.float64, copy=True)
     proposals: list[np.ndarray] = []
@@ -872,6 +879,21 @@ def _proposal_points(
         proposals.append(centroid)
         proposals.append(current + 0.35 * delta)
         proposals.append(current + 0.70 * delta)
+
+    if route_weight > 0.0:
+        for target in _route_relief_targets(
+            placement,
+            benchmark,
+            macro_idx,
+            node_nets,
+            nets,
+            pressure,
+            limit=_env_int("OURS_SOFT_SEARCH_ROUTE_TARGETS", 0),
+        ):
+            delta = target - current
+            proposals.append(current + 0.35 * delta)
+            proposals.append(current + 0.70 * delta)
+            proposals.append(target)
 
     jitter_sigma = _env_float("OURS_SOFT_SEARCH_JITTER", 0.030) * max(diag, 1e-9)
     for _ in range(max(0, _env_int("OURS_SOFT_SEARCH_JITTERS", 2))):
@@ -920,6 +942,8 @@ def _bulk_candidates(
     node_nets: list[list[int]],
     nets: list[list[int]],
     cold_centers: list[np.ndarray],
+    pressure: np.ndarray,
+    route_weight: float,
     round_idx: int,
 ) -> list[np.ndarray]:
     if not ranked:
@@ -931,11 +955,30 @@ def _bulk_candidates(
     max_count = max(1, _env_int("OURS_SOFT_SEARCH_BULK_MAX", 512))
     counts = sorted({max(1, min(int(c), len(ranked), max_count)) for c in counts})
     out: list[np.ndarray] = []
+    route_cache: dict[int, np.ndarray | None] = {}
+
+    def route_target(idx: int) -> np.ndarray | None:
+        if idx not in route_cache:
+            targets = _route_relief_targets(
+                placement,
+                benchmark,
+                idx,
+                node_nets,
+                nets,
+                pressure,
+                limit=1,
+            )
+            route_cache[idx] = targets[0] if targets else None
+        return route_cache[idx]
+
+    modes = ["mixed", "cold", "centroid"]
+    if route_weight > 0.0 and _env_bool("OURS_SOFT_SEARCH_BULK_ROUTE", "0"):
+        modes.insert(0, "route")
 
     for count in counts:
         selected = ranked[:count]
         for alpha in alphas:
-            for mode in ("mixed", "cold", "centroid"):
+            for mode in modes:
                 cand = placement.copy()
                 moved = 0
                 for order, idx_raw in enumerate(selected):
@@ -945,7 +988,12 @@ def _bulk_candidates(
                     cold = None
                     if cold_centers:
                         cold = cold_centers[(order * 9973 + round_idx * 37) % len(cold_centers)]
-                    if mode == "centroid":
+                    route = route_target(idx) if route_weight > 0.0 else None
+                    if mode == "route":
+                        if route is None:
+                            continue
+                        target = route
+                    elif mode == "centroid":
                         if centroid is None:
                             continue
                         target = centroid
@@ -954,7 +1002,13 @@ def _bulk_candidates(
                             continue
                         target = cold
                     else:
-                        if centroid is not None and cold is not None:
+                        if route is not None and centroid is not None and cold is not None:
+                            target = 0.52 * centroid + 0.33 * route + 0.15 * cold
+                        elif route is not None and centroid is not None:
+                            target = 0.62 * centroid + 0.38 * route
+                        elif route is not None and cold is not None:
+                            target = 0.62 * route + 0.38 * cold
+                        elif centroid is not None and cold is not None:
                             target = 0.68 * centroid + 0.32 * cold
                         elif centroid is not None:
                             target = centroid
@@ -967,6 +1021,134 @@ def _bulk_candidates(
                 if moved > 0:
                     out.append(cand)
     return out
+
+
+def _route_relief_targets(
+    placement: np.ndarray,
+    benchmark: Benchmark,
+    macro_idx: int,
+    node_nets: list[list[int]],
+    nets: list[list[int]],
+    pressure: np.ndarray,
+    *,
+    limit: int,
+) -> list[np.ndarray]:
+    if limit <= 0 or pressure.size == 0 or not node_nets[macro_idx]:
+        return []
+    rows, cols = pressure.shape
+    if rows <= 0 or cols <= 0:
+        return []
+
+    bin_w = float(benchmark.canvas_width) / max(cols, 1)
+    bin_h = float(benchmark.canvas_height) / max(rows, 1)
+    diag = max(float(np.hypot(float(benchmark.canvas_width), float(benchmark.canvas_height))), 1e-9)
+    flat_pressure = pressure.reshape(-1)
+    pressure_scale = max(float(np.percentile(flat_pressure, 90)), float(flat_pressure.mean()), 1e-9)
+    integral = np.pad(pressure, ((1, 0), (1, 0)), mode="constant").cumsum(axis=0).cumsum(axis=1)
+
+    other_cells_by_net: list[list[tuple[int, int]]] = []
+    n_all = int(benchmark.num_macros)
+    ports = benchmark.port_positions.detach().cpu().numpy().astype(np.float64, copy=False)
+    for net_idx in node_nets[macro_idx]:
+        cells: list[tuple[int, int]] = []
+        for node in nets[net_idx]:
+            if int(node) == macro_idx:
+                continue
+            if 0 <= int(node) < n_all:
+                x, y = placement[int(node)]
+            else:
+                port_idx = int(node) - n_all
+                if not (0 <= port_idx < len(ports)):
+                    continue
+                x, y = ports[port_idx]
+            cells.append(_point_cell(float(x), float(y), bin_w, bin_h, rows, cols))
+        if cells:
+            other_cells_by_net.append(cells)
+    if not other_cells_by_net:
+        return []
+
+    current = placement[macro_idx].astype(np.float64, copy=False)
+    centroid = _connected_centroid(placement, benchmark, macro_idx, node_nets, nets)
+    if centroid is None:
+        centroid = current
+
+    candidate_flats: set[int] = set()
+    low_pool = min(int(pressure.size), max(limit * _env_int("OURS_SOFT_SEARCH_ROUTE_POOL", 36), limit))
+    if low_pool > 0:
+        order = np.argpartition(flat_pressure, low_pool - 1)[:low_pool]
+        order = order[np.argsort(flat_pressure[order])]
+        candidate_flats.update(int(flat) for flat in order)
+
+    radius = max(0, _env_int("OURS_SOFT_SEARCH_ROUTE_RADIUS", 5))
+    for point in (current, centroid):
+        row, col = _point_cell(float(point[0]), float(point[1]), bin_w, bin_h, rows, cols)
+        for rr in range(max(0, row - radius), min(rows, row + radius + 1)):
+            for cc in range(max(0, col - radius), min(cols, col + radius + 1)):
+                candidate_flats.add(rr * cols + cc)
+
+    scored: list[tuple[float, int]] = []
+    dist_weight = _env_float("OURS_SOFT_SEARCH_ROUTE_DIST", 0.18)
+    move_weight = _env_float("OURS_SOFT_SEARCH_ROUTE_MOVE", 0.04)
+    span_weight = _env_float("OURS_SOFT_SEARCH_ROUTE_SPAN", 0.10)
+    for flat in candidate_flats:
+        rr = int(flat // cols)
+        cc = int(flat % cols)
+        target = np.asarray([(cc + 0.5) * bin_w, (rr + 0.5) * bin_h], dtype=np.float64)
+        route_cost = 0.0
+        for cells in other_cells_by_net:
+            rows_all = [rr]
+            cols_all = [cc]
+            rows_all.extend(row for row, _ in cells)
+            cols_all.extend(col for _, col in cells)
+            r0 = max(0, min(rows_all))
+            r1 = min(rows - 1, max(rows_all))
+            c0 = max(0, min(cols_all))
+            c1 = min(cols - 1, max(cols_all))
+            area = max(1, (r1 - r0 + 1) * (c1 - c0 + 1))
+            avg_pressure = (
+                integral[r1 + 1, c1 + 1]
+                - integral[r0, c1 + 1]
+                - integral[r1 + 1, c0]
+                + integral[r0, c0]
+            ) / float(area)
+            span = ((r1 - r0 + 1) / max(rows, 1)) + ((c1 - c0 + 1) / max(cols, 1))
+            route_cost += float(avg_pressure) + pressure_scale * span_weight * float(span)
+        route_cost /= max(1, len(other_cells_by_net))
+        centroid_dist = float(np.linalg.norm(target - centroid)) / diag
+        move_dist = float(np.linalg.norm(target - current)) / diag
+        score = (
+            route_cost
+            + 0.20 * float(flat_pressure[flat])
+            + pressure_scale * (dist_weight * centroid_dist + move_weight * move_dist)
+        )
+        scored.append((score, int(flat)))
+
+    scored.sort(key=lambda item: item[0])
+    targets: list[np.ndarray] = []
+    seen: set[int] = set()
+    for _, flat in scored:
+        if flat in seen:
+            continue
+        seen.add(flat)
+        rr = int(flat // cols)
+        cc = int(flat % cols)
+        targets.append(np.asarray([(cc + 0.5) * bin_w, (rr + 0.5) * bin_h], dtype=np.float64))
+        if len(targets) >= limit:
+            break
+    return targets
+
+
+def _point_cell(
+    x: float,
+    y: float,
+    bin_w: float,
+    bin_h: float,
+    rows: int,
+    cols: int,
+) -> tuple[int, int]:
+    col = min(cols - 1, max(0, int(float(x) / max(bin_w, 1e-12))))
+    row = min(rows - 1, max(0, int(float(y) / max(bin_h, 1e-12))))
+    return row, col
 
 
 def _clamp_point(point: np.ndarray, benchmark: Benchmark, macro_idx: int) -> np.ndarray:
