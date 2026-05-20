@@ -143,7 +143,7 @@ def refine_with_soft_search(
         cand_cost = float(cand_exact["proxy_cost"])
         if best_exact_cost is None or cand_cost < best_exact_cost - eps:
             current = cand.copy()
-            best_fast = min(best_fast, float(fast_cost))
+            best_fast = float(fast_cost)
             best_exact_cost = cand_cost
             best_exact = candidate.detach().clone().float()
             accepted += 1
