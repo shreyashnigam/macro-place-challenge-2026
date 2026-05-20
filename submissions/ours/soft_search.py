@@ -278,7 +278,7 @@ def _refine_with_soft_search_portfolio(
     best_cost = float(base_costs["proxy_cost"])
     eps = _env_float("OURS_SOFT_SEARCH_EPS", 1e-6)
     base_seed = _env_int("OURS_SOFT_SEARCH_SEED", 20260519)
-    modes = _env("OURS_SOFT_SEARCH_PORTFOLIO_MODES", "single,bulk")
+    modes = _env("OURS_SOFT_SEARCH_PORTFOLIO_MODES", "bulk")
     parsed_modes = [mode.strip().lower() for mode in modes.split(",") if mode.strip()]
     if not parsed_modes:
         parsed_modes = ["single", "bulk"]
