@@ -345,6 +345,7 @@ def _portfolio_tasks(
     base_seed: int,
 ) -> list[tuple[str, str, int]]:
     tasks: list[tuple[str, str, int]] = []
+    diversify_routes = _env_bool("OURS_SOFT_SEARCH_PORTFOLIO_DIVERSE_SEEDS", "0")
     for route_idx, route in enumerate(parsed_routes):
         if route not in {"auto", "adaptive", "default"}:
             try:
@@ -354,7 +355,8 @@ def _portfolio_tasks(
         for mode_idx, mode in enumerate(parsed_modes):
             if mode not in {"single", "solo", "greedy", "bulk", "batch"}:
                 continue
-            seed = base_seed + 1009 * mode_idx + 104729 * route_idx
+            route_offset = 104729 * route_idx if diversify_routes else 0
+            seed = base_seed + 1009 * mode_idx + route_offset
             tasks.append((route, mode, seed))
     return tasks
 
