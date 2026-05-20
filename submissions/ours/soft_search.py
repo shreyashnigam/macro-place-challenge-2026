@@ -283,7 +283,7 @@ def _refine_with_soft_search_portfolio(
     parsed_modes = [mode.strip().lower() for mode in modes.split(",") if mode.strip()]
     if not parsed_modes:
         parsed_modes = ["bulk"]
-    routes = _env("OURS_SOFT_SEARCH_PORTFOLIO_ROUTES", "auto,0.25,0.50")
+    routes = _env("OURS_SOFT_SEARCH_PORTFOLIO_ROUTES", "3.00,0.00,0.25,0.50")
     parsed_routes = [route.strip().lower() for route in routes.split(",") if route.strip()]
     if not parsed_routes:
         parsed_routes = ["auto"]
@@ -367,7 +367,7 @@ def _portfolio_candidates(
     load_plc: Callable[[Benchmark], object | None],
     is_valid: Callable[[torch.Tensor, Benchmark], bool],
 ) -> list[tuple[str, str, torch.Tensor]]:
-    workers = max(1, _env_int("OURS_SOFT_SEARCH_PORTFOLIO_WORKERS", 1))
+    workers = max(1, _env_int("OURS_SOFT_SEARCH_PORTFOLIO_WORKERS", min(4, len(tasks))))
     if workers <= 1 or len(tasks) <= 1:
         return [
             (
