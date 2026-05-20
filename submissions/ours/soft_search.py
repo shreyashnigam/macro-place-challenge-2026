@@ -8,6 +8,7 @@ guarded by the official proxy evaluator before it replaces the input placement.
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor
+import multiprocessing as mp
 import os
 from pathlib import Path
 import sys
@@ -391,7 +392,14 @@ def _portfolio_candidates(
     max_workers = min(workers, len(tasks))
     results: list[tuple[str, str, torch.Tensor]] = []
     try:
-        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+        pool_kwargs = {}
+        start_method = _env("OURS_SOFT_SEARCH_PORTFOLIO_START", "fork").strip()
+        if start_method:
+            try:
+                pool_kwargs["mp_context"] = mp.get_context(start_method)
+            except ValueError:
+                _debug(f"unsupported multiprocessing start={start_method!r}; using default")
+        with ProcessPoolExecutor(max_workers=max_workers, **pool_kwargs) as pool:
             futures = [
                 pool.submit(
                     _run_portfolio_candidate_worker,
@@ -407,12 +415,18 @@ def _portfolio_candidates(
             for future, (route, mode) in zip(futures, route_modes):
                 try:
                     results.append((route, mode, future.result()))
-                except Exception:
+                except Exception as exc:
+                    _debug(f"portfolio worker route={route} mode={mode} failed: {type(exc).__name__}")
                     continue
-    except Exception:
+    except Exception as exc:
+        _debug(f"portfolio parallel failed: {type(exc).__name__}")
         results = []
     if len(results) == len(tasks):
         return results
+    if results:
+        _debug(f"portfolio incomplete results={len(results)} tasks={len(tasks)}; falling back to serial")
+    else:
+        _debug(f"portfolio falling back to serial tasks={len(tasks)}")
     return [
         (
             route,
