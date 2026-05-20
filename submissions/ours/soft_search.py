@@ -62,6 +62,17 @@ def refine_with_soft_search(
     if n_hard >= n_all:
         return baseline
 
+    def maybe_soft_sa(candidate: torch.Tensor) -> torch.Tensor:
+        if not _env_bool("OURS_SOFT_SEARCH_SA", "0"):
+            return candidate
+        return _refine_with_soft_sa(
+            candidate,
+            benchmark,
+            plc,
+            scorer,
+            is_valid=is_valid,
+        )
+
     fixed = benchmark.macro_fixed.detach().cpu().numpy().astype(bool, copy=False)
     soft_indices = np.asarray([i for i in range(n_hard, n_all) if not fixed[i]], dtype=np.int32)
     if soft_indices.size == 0:
@@ -81,7 +92,7 @@ def refine_with_soft_search(
     search_started = time.monotonic()
     timeout = max(0.0, _env_float("OURS_SOFT_SEARCH_TIMEOUT", 3200.0))
     if max_trials <= 0:
-        return baseline
+        return maybe_soft_sa(baseline)
 
     rng = np.random.default_rng(_env_int("OURS_SOFT_SEARCH_SEED", 20260519))
     node_nets, nets = _build_node_nets(benchmark)
@@ -272,21 +283,21 @@ def refine_with_soft_search(
             break
 
     if accepted == 0:
-        return baseline
+        return maybe_soft_sa(baseline)
 
     candidate = torch.tensor(current, dtype=baseline.dtype)
     if not is_valid(candidate, benchmark):
         if exact_guard and best_exact is not None and best_exact_cost is not None:
             if base_exact_cost is not None and best_exact_cost < base_exact_cost - eps:
-                return best_exact.detach().clone().float()
-        return baseline
+                return maybe_soft_sa(best_exact.detach().clone().float())
+        return maybe_soft_sa(baseline)
 
     if not exact_guard:
         _debug(
             f"accepted without exact guard fast={best_fast:.6f} "
             f"accepted={accepted} trials={total_trials}"
         )
-        return candidate.detach().clone().float()
+        return maybe_soft_sa(candidate.detach().clone().float())
 
     if last_exact_accept != accepted:
         checkpoint_exact("final")
@@ -301,13 +312,193 @@ def refine_with_soft_search(
             f"{base_exact_cost:.6f}->{best_exact_cost:.6f} "
             f"fast={best_fast:.6f} accepted={accepted} trials={total_trials}"
         )
-        return best_exact.detach().clone().float()
+        return maybe_soft_sa(best_exact.detach().clone().float())
 
     final_exact = best_exact_cost if best_exact_cost is not None else base_exact_cost
     _debug(
         "rejected exact "
         f"{base_exact_cost:.6f}->{final_exact:.6f} "
         f"fast={best_fast:.6f} accepted={accepted} trials={total_trials}"
+    )
+    return maybe_soft_sa(baseline)
+
+
+def _refine_with_soft_sa(
+    baseline: torch.Tensor,
+    benchmark: Benchmark,
+    plc,
+    scorer,
+    *,
+    is_valid: Callable[[torch.Tensor, Benchmark], bool],
+) -> torch.Tensor:
+    max_trials = max(0, _env_int("OURS_SOFT_SEARCH_SA_TRIALS", 100000))
+    timeout = max(0.0, _env_float("OURS_SOFT_SEARCH_SA_TIMEOUT", 0.0))
+    if max_trials <= 0 or timeout <= 0.0:
+        return baseline
+
+    n_hard = int(benchmark.num_hard_macros)
+    n_all = int(benchmark.num_macros)
+    fixed = benchmark.macro_fixed.detach().cpu().numpy().astype(bool, copy=False)
+    soft_indices = np.asarray([i for i in range(n_hard, n_all) if not fixed[i]], dtype=np.int32)
+    if soft_indices.size == 0:
+        return baseline
+
+    eps = _env_float("OURS_SOFT_SEARCH_EPS", 1e-6)
+    try:
+        base_exact = compute_proxy_cost(baseline.detach().float(), benchmark, plc)
+    except Exception:
+        return baseline
+    if int(base_exact.get("overlap_count", 1)) != 0:
+        return baseline
+    base_exact_cost = float(base_exact["proxy_cost"])
+
+    try:
+        current = baseline.detach().cpu().numpy().astype(np.float64, copy=True)
+        current_fast = float(scorer.score(current)["proxy_cost"])
+    except Exception:
+        return baseline
+
+    best = current.copy()
+    best_fast = current_fast
+    rng = np.random.default_rng(_env_int("OURS_SOFT_SEARCH_SA_SEED", 20260520))
+    node_nets, nets = _build_node_nets(benchmark)
+    diag = max(float(np.hypot(float(benchmark.canvas_width), float(benchmark.canvas_height))), 1e-9)
+    move_min = max(0.0, _env_float("OURS_SOFT_SEARCH_SA_MOVE_MIN", 0.002)) * diag
+    move_max0 = max(move_min, _env_float("OURS_SOFT_SEARCH_SA_MOVE_MAX", 0.18) * diag)
+    move_max1 = max(move_min, _env_float("OURS_SOFT_SEARCH_SA_MOVE_END", 0.015) * diag)
+    temp0 = max(1e-12, _env_float("OURS_SOFT_SEARCH_SA_T0", 0.080))
+    temp1 = max(1e-12, _env_float("OURS_SOFT_SEARCH_SA_T1", 0.001))
+    pool_size = max(1, _env_int("OURS_SOFT_SEARCH_SA_POOL", 512))
+    rank_period = max(1, _env_int("OURS_SOFT_SEARCH_SA_RANK_PERIOD", 2048))
+    route_prob = min(1.0, max(0.0, _env_float("OURS_SOFT_SEARCH_SA_ROUTE_PROB", 0.20)))
+    centroid_prob = min(1.0, max(0.0, _env_float("OURS_SOFT_SEARCH_SA_CENTROID_PROB", 0.20)))
+    cold_prob = min(1.0, max(0.0, _env_float("OURS_SOFT_SEARCH_SA_COLD_PROB", 0.25)))
+
+    ranked = list(int(i) for i in soft_indices[:pool_size])
+    pressure = np.zeros((int(benchmark.grid_rows), int(benchmark.grid_cols)), dtype=np.float64)
+    cold: list[np.ndarray] = []
+    route_weight = 0.0
+
+    started = time.monotonic()
+    accepted = 0
+    total = 0
+    best_updates = 0
+
+    def timed_out() -> bool:
+        return timeout > 0.0 and time.monotonic() - started >= timeout
+
+    def refresh_rank() -> None:
+        nonlocal ranked, pressure, cold, route_weight
+        try:
+            maps = scorer.score(current, maps=True)
+            pressure = _pressure_map(maps, benchmark)
+            route_weight = _soft_route_weight(maps)
+            ranked = _rank_soft_macros(
+                current,
+                benchmark,
+                soft_indices,
+                node_nets,
+                nets,
+                pressure,
+                route_weight=route_weight,
+            )[: min(pool_size, len(soft_indices))]
+            cold = _cold_centers(pressure, benchmark)
+        except Exception:
+            ranked = list(int(i) for i in soft_indices[:pool_size])
+            pressure = np.zeros((int(benchmark.grid_rows), int(benchmark.grid_cols)), dtype=np.float64)
+            cold = []
+            route_weight = 0.0
+
+    refresh_rank()
+    if not ranked:
+        return baseline
+
+    while total < max_trials and not timed_out():
+        if total > 0 and total % rank_period == 0:
+            refresh_rank()
+            if not ranked:
+                break
+
+        frac = float(total) / max(1.0, float(max_trials - 1))
+        temp = temp0 * ((temp1 / temp0) ** frac)
+        move_max = move_max0 * ((move_max1 / max(move_max0, 1e-12)) ** frac)
+        idx = int(ranked[int(rng.integers(0, len(ranked)))])
+        old = current[idx].copy()
+
+        roll = float(rng.random())
+        target: np.ndarray | None = None
+        if route_weight > 0.0 and roll < route_prob:
+            targets = _route_relief_targets(
+                current,
+                benchmark,
+                idx,
+                node_nets,
+                nets,
+                pressure,
+                limit=1,
+            )
+            if targets:
+                target = targets[0]
+        if target is None and roll < route_prob + centroid_prob:
+            target = _connected_centroid(current, benchmark, idx, node_nets, nets)
+        if target is None and roll < route_prob + centroid_prob + cold_prob and cold:
+            target = cold[int(rng.integers(0, len(cold)))]
+
+        if target is not None:
+            alpha = float(rng.uniform(0.20, 0.85))
+            point = old + alpha * (target - old)
+            if move_min > 0.0:
+                point = point + rng.normal(0.0, move_min, size=2)
+        else:
+            angle = float(rng.random()) * 2.0 * math.pi
+            mag = move_min + float(rng.random()) * max(0.0, move_max - move_min)
+            point = old + np.asarray([math.cos(angle) * mag, math.sin(angle) * mag], dtype=np.float64)
+
+        current[idx] = _clamp_point(point, benchmark, idx)
+        total += 1
+        try:
+            score = scorer.score(current)
+        except Exception:
+            current[idx] = old
+            continue
+        if int(score.get("overlap_count", 1)) != 0:
+            current[idx] = old
+            continue
+        new_fast = float(score["proxy_cost"])
+        delta = new_fast - current_fast
+        if delta <= 0.0 or float(rng.random()) < math.exp(-delta / max(temp, 1e-12)):
+            current_fast = new_fast
+            accepted += 1
+            if new_fast < best_fast - eps:
+                best_fast = new_fast
+                best = current.copy()
+                best_updates += 1
+        else:
+            current[idx] = old
+
+    if best_updates == 0:
+        _debug(f"soft-sa no fast improvement trials={total} accepted={accepted}")
+        return baseline
+
+    candidate = torch.tensor(best, dtype=baseline.dtype)
+    if not is_valid(candidate, benchmark):
+        return baseline
+    try:
+        cand_exact = compute_proxy_cost(candidate.detach().float(), benchmark, plc)
+    except Exception:
+        return baseline
+    if int(cand_exact.get("overlap_count", 1)) != 0:
+        return baseline
+    cand_cost = float(cand_exact["proxy_cost"])
+    if cand_cost < base_exact_cost - eps:
+        _debug(
+            f"soft-sa accepted exact {base_exact_cost:.6f}->{cand_cost:.6f} "
+            f"fast={best_fast:.6f} trials={total} accepted={accepted}"
+        )
+        return candidate.detach().clone().float()
+    _debug(
+        f"soft-sa rejected exact {base_exact_cost:.6f}->{cand_cost:.6f} "
+        f"fast={best_fast:.6f} trials={total} accepted={accepted}"
     )
     return baseline
 
