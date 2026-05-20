@@ -392,6 +392,8 @@ def _portfolio_candidates(
     max_workers = min(workers, len(tasks))
     results: list[tuple[str, str, torch.Tensor]] = []
     try:
+        baseline_np = baseline.detach().cpu().float().numpy().copy()
+        benchmark_name = str(benchmark.name)
         pool_kwargs = {}
         start_method = _env("OURS_SOFT_SEARCH_PORTFOLIO_START", "fork").strip()
         if start_method:
@@ -403,8 +405,8 @@ def _portfolio_candidates(
             futures = [
                 pool.submit(
                     _run_portfolio_candidate_worker,
-                    baseline.detach().cpu().float(),
-                    benchmark,
+                    baseline_np,
+                    benchmark_name,
                     route,
                     mode,
                     seed,
@@ -449,19 +451,27 @@ def _portfolio_candidates(
 
 
 def _run_portfolio_candidate_worker(
-    baseline: torch.Tensor,
-    benchmark: Benchmark,
+    baseline_array: np.ndarray,
+    benchmark_name: str,
     route: str,
     mode: str,
     seed: int,
 ) -> torch.Tensor:
+    loaded = _load_benchmark_and_plc_for_worker(benchmark_name)
+    if loaded is None:
+        return torch.tensor(baseline_array, dtype=torch.float32)
+    benchmark, plc = loaded
+
+    def load_plc(_: Benchmark):
+        return plc
+
     return _run_portfolio_candidate(
-        baseline,
+        torch.tensor(baseline_array, dtype=torch.float32),
         benchmark,
         route,
         mode,
         seed,
-        load_plc=_load_plc_for_worker,
+        load_plc=load_plc,
         is_valid=_is_valid_for_worker,
     )
 
@@ -516,18 +526,17 @@ def _run_portfolio_candidate(
             os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = old_route
 
 
-def _load_plc_for_worker(benchmark: Benchmark):
+def _load_benchmark_and_plc_for_worker(benchmark_name: str):
     try:
         from macro_place.loader import load_benchmark, load_benchmark_from_dir
     except Exception:
         return None
 
-    name = str(benchmark.name)
+    name = str(benchmark_name)
     ibm_dir = Path("external/MacroPlacement/Testcases/ICCAD04") / name
     if (ibm_dir / "netlist.pb.txt").exists():
         try:
-            _, plc = load_benchmark_from_dir(str(ibm_dir))
-            return plc
+            return load_benchmark_from_dir(str(ibm_dir))
         except Exception:
             return None
 
@@ -546,15 +555,21 @@ def _load_plc_for_worker(benchmark: Benchmark):
     )
     if (ng45 / "netlist.pb.txt").exists():
         try:
-            _, plc = load_benchmark(
+            return load_benchmark(
                 str(ng45 / "netlist.pb.txt"),
                 str(ng45 / "initial.plc"),
                 name=name,
             )
-            return plc
         except Exception:
             return None
     return None
+
+
+def _load_plc_for_worker(benchmark: Benchmark):
+    loaded = _load_benchmark_and_plc_for_worker(str(benchmark.name))
+    if loaded is None:
+        return None
+    return loaded[1]
 
 
 def _is_valid_for_worker(placement: torch.Tensor, benchmark: Benchmark) -> bool:
