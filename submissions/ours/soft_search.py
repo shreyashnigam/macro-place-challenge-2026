@@ -416,10 +416,13 @@ def _portfolio_candidates(
                 try:
                     results.append((route, mode, future.result()))
                 except Exception as exc:
-                    _debug(f"portfolio worker route={route} mode={mode} failed: {type(exc).__name__}")
+                    _debug(
+                        f"portfolio worker route={route} mode={mode} failed: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
                     continue
     except Exception as exc:
-        _debug(f"portfolio parallel failed: {type(exc).__name__}")
+        _debug(f"portfolio parallel failed: {type(exc).__name__}: {exc}")
         results = []
     if len(results) == len(tasks):
         return results
