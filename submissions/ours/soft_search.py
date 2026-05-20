@@ -7,6 +7,7 @@ guarded by the official proxy evaluator before it replaces the input placement.
 
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor
 import os
 from pathlib import Path
 import sys
@@ -293,44 +294,30 @@ def _refine_with_soft_search_portfolio(
     old_route = os.environ.get("OURS_SOFT_SEARCH_ROUTE_WEIGHT")
     os.environ["_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE"] = "1"
     try:
-        for route_idx, route in enumerate(parsed_routes):
-            if route in {"auto", "adaptive", "default"}:
-                os.environ.pop("OURS_SOFT_SEARCH_ROUTE_WEIGHT", None)
-            else:
-                try:
-                    os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = str(max(0.0, float(route)))
-                except ValueError:
-                    continue
-            for mode_idx, mode in enumerate(parsed_modes):
-                if mode in {"single", "solo", "greedy"}:
-                    os.environ["OURS_SOFT_SEARCH_BULK"] = "0"
-                elif mode in {"bulk", "batch"}:
-                    os.environ["OURS_SOFT_SEARCH_BULK"] = "1"
-                else:
-                    continue
-                seed = base_seed + 1009 * mode_idx + 104729 * route_idx
-                os.environ["OURS_SOFT_SEARCH_SEED"] = str(seed)
-                candidate = refine_with_soft_search(
-                    baseline,
-                    benchmark,
-                    load_plc=load_plc,
-                    is_valid=is_valid,
-                )
-                if torch.allclose(candidate, baseline, atol=1e-7, rtol=0.0):
-                    continue
-                if not is_valid(candidate, benchmark):
-                    continue
-                try:
-                    costs = compute_proxy_cost(candidate.detach().float(), benchmark, plc)
-                except Exception:
-                    continue
-                if int(costs.get("overlap_count", 1)) != 0:
-                    continue
-                cost = float(costs["proxy_cost"])
-                if cost < best_cost - eps:
-                    best = candidate.detach().clone().float()
-                    best_cost = cost
-                    _debug(f"portfolio route={route} mode={mode} exact={best_cost:.6f}")
+        tasks = _portfolio_tasks(parsed_routes, parsed_modes, base_seed)
+        candidates = _portfolio_candidates(
+            baseline,
+            benchmark,
+            tasks,
+            load_plc=load_plc,
+            is_valid=is_valid,
+        )
+        for route, mode, candidate in candidates:
+            if torch.allclose(candidate, baseline, atol=1e-7, rtol=0.0):
+                continue
+            if not is_valid(candidate, benchmark):
+                continue
+            try:
+                costs = compute_proxy_cost(candidate.detach().float(), benchmark, plc)
+            except Exception:
+                continue
+            if int(costs.get("overlap_count", 1)) != 0:
+                continue
+            cost = float(costs["proxy_cost"])
+            if cost < best_cost - eps:
+                best = candidate.detach().clone().float()
+                best_cost = cost
+                _debug(f"portfolio route={route} mode={mode} exact={best_cost:.6f}")
     finally:
         if old_active is None:
             os.environ.pop("_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE", None)
@@ -350,6 +337,148 @@ def _refine_with_soft_search_portfolio(
             os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = old_route
 
     return best
+
+
+def _portfolio_tasks(
+    parsed_routes: list[str],
+    parsed_modes: list[str],
+    base_seed: int,
+) -> list[tuple[str, str, int]]:
+    tasks: list[tuple[str, str, int]] = []
+    for route_idx, route in enumerate(parsed_routes):
+        if route not in {"auto", "adaptive", "default"}:
+            try:
+                float(route)
+            except ValueError:
+                continue
+        for mode_idx, mode in enumerate(parsed_modes):
+            if mode not in {"single", "solo", "greedy", "bulk", "batch"}:
+                continue
+            seed = base_seed + 1009 * mode_idx + 104729 * route_idx
+            tasks.append((route, mode, seed))
+    return tasks
+
+
+def _portfolio_candidates(
+    baseline: torch.Tensor,
+    benchmark: Benchmark,
+    tasks: list[tuple[str, str, int]],
+    *,
+    load_plc: Callable[[Benchmark], object | None],
+    is_valid: Callable[[torch.Tensor, Benchmark], bool],
+) -> list[tuple[str, str, torch.Tensor]]:
+    workers = max(1, _env_int("OURS_SOFT_SEARCH_PORTFOLIO_WORKERS", 1))
+    if workers <= 1 or len(tasks) <= 1:
+        return [
+            (
+                route,
+                mode,
+                _run_portfolio_candidate(
+                    baseline,
+                    benchmark,
+                    route,
+                    mode,
+                    seed,
+                    load_plc=load_plc,
+                    is_valid=is_valid,
+                ),
+            )
+            for route, mode, seed in tasks
+        ]
+
+    max_workers = min(workers, len(tasks))
+    results: list[tuple[str, str, torch.Tensor]] = []
+    try:
+        with ProcessPoolExecutor(max_workers=max_workers) as pool:
+            futures = [
+                pool.submit(
+                    _run_portfolio_candidate,
+                    baseline.detach().cpu().float(),
+                    benchmark,
+                    route,
+                    mode,
+                    seed,
+                    load_plc=load_plc,
+                    is_valid=is_valid,
+                )
+                for route, mode, seed in tasks
+            ]
+            route_modes = [(route, mode) for route, mode, _ in tasks]
+            for future, (route, mode) in zip(futures, route_modes):
+                try:
+                    results.append((route, mode, future.result()))
+                except Exception:
+                    continue
+    except Exception:
+        results = []
+    if len(results) == len(tasks):
+        return results
+    return [
+        (
+            route,
+            mode,
+            _run_portfolio_candidate(
+                baseline,
+                benchmark,
+                route,
+                mode,
+                seed,
+                load_plc=load_plc,
+                is_valid=is_valid,
+            ),
+        )
+        for route, mode, seed in tasks
+    ]
+
+
+def _run_portfolio_candidate(
+    baseline: torch.Tensor,
+    benchmark: Benchmark,
+    route: str,
+    mode: str,
+    seed: int,
+    *,
+    load_plc: Callable[[Benchmark], object | None],
+    is_valid: Callable[[torch.Tensor, Benchmark], bool],
+) -> torch.Tensor:
+    old_active = os.environ.get("_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE")
+    old_bulk = os.environ.get("OURS_SOFT_SEARCH_BULK")
+    old_seed = os.environ.get("OURS_SOFT_SEARCH_SEED")
+    old_route = os.environ.get("OURS_SOFT_SEARCH_ROUTE_WEIGHT")
+    os.environ["_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE"] = "1"
+    try:
+        if route in {"auto", "adaptive", "default"}:
+            os.environ.pop("OURS_SOFT_SEARCH_ROUTE_WEIGHT", None)
+        else:
+            os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = str(max(0.0, float(route)))
+        if mode in {"single", "solo", "greedy"}:
+            os.environ["OURS_SOFT_SEARCH_BULK"] = "0"
+        else:
+            os.environ["OURS_SOFT_SEARCH_BULK"] = "1"
+        os.environ["OURS_SOFT_SEARCH_SEED"] = str(seed)
+        return refine_with_soft_search(
+            baseline,
+            benchmark,
+            load_plc=load_plc,
+            is_valid=is_valid,
+        ).detach().cpu().float()
+    finally:
+        if old_active is None:
+            os.environ.pop("_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE", None)
+        else:
+            os.environ["_OURS_SOFT_SEARCH_PORTFOLIO_ACTIVE"] = old_active
+        if old_bulk is None:
+            os.environ.pop("OURS_SOFT_SEARCH_BULK", None)
+        else:
+            os.environ["OURS_SOFT_SEARCH_BULK"] = old_bulk
+        if old_seed is None:
+            os.environ.pop("OURS_SOFT_SEARCH_SEED", None)
+        else:
+            os.environ["OURS_SOFT_SEARCH_SEED"] = old_seed
+        if old_route is None:
+            os.environ.pop("OURS_SOFT_SEARCH_ROUTE_WEIGHT", None)
+        else:
+            os.environ["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = old_route
 
 
 def _build_node_nets(benchmark: Benchmark) -> tuple[list[list[int]], list[list[int]]]:
