@@ -81,41 +81,44 @@ def refine_with_analytical(
         if time.monotonic() - start_time > timeout and name != "base":
             break
         try:
-            candidate = _run_global_place(
+            raw_candidates = _run_global_place(
                 benchmark,
                 config,
                 steps=steps,
                 grid=grid,
             )
-            gap = _env_float("OURS_ANALYTICAL_GAP", 0.005)
-            candidate = _spiral_legalize_hard(candidate, benchmark, gap=gap)
-            if not is_valid(candidate, benchmark):
-                candidate = legalize_hard(
-                    candidate,
-                    benchmark,
-                    gap=gap,
-                    max_rounds=_env_int("OURS_ANALYTICAL_LEGALIZE_ROUNDS", 500),
+            candidates = raw_candidates if isinstance(raw_candidates, list) else [raw_candidates]
+            for cand_idx, raw_candidate in enumerate(candidates):
+                candidate = raw_candidate
+                gap = _env_float("OURS_ANALYTICAL_GAP", 0.005)
+                candidate = _spiral_legalize_hard(candidate, benchmark, gap=gap)
+                if not is_valid(candidate, benchmark):
+                    candidate = legalize_hard(
+                        candidate,
+                        benchmark,
+                        gap=gap,
+                        max_rounds=_env_int("OURS_ANALYTICAL_LEGALIZE_ROUNDS", 500),
+                    )
+                if not is_valid(candidate, benchmark):
+                    _debug(f"{name}[{cand_idx}]: invalid after legalization")
+                    continue
+                if _env_bool("OURS_ANALYTICAL_SOFT_REFINE", "0"):
+                    candidate = _refine_soft(candidate, benchmark, config, grid=grid)
+                costs = (
+                    fast_scorer.score(candidate)
+                    if fast_scorer is not None
+                    else compute_proxy_cost(candidate, benchmark, plc)
                 )
-            if not is_valid(candidate, benchmark):
-                _debug(f"{name}: invalid after legalization")
-                continue
-            if _env_bool("OURS_ANALYTICAL_SOFT_REFINE", "0"):
-                candidate = _refine_soft(candidate, benchmark, config, grid=grid)
-            costs = (
-                fast_scorer.score(candidate)
-                if fast_scorer is not None
-                else compute_proxy_cost(candidate, benchmark, plc)
-            )
-            if int(costs.get("overlap_count", 1)) != 0:
-                _debug(f"{name}: overlap_count={costs.get('overlap_count')}")
-                continue
-            cost = float(costs["proxy_cost"])
-            label = "fast" if fast_scorer is not None else "proxy"
-            _debug(f"{name}: {label}={cost:.6f} best_select={best_select_cost:.6f}")
-            if cost < best_select_cost:
-                best_select_cost = cost
-                best = candidate.detach().clone().float()
-                best_name = name
+                if int(costs.get("overlap_count", 1)) != 0:
+                    _debug(f"{name}[{cand_idx}]: overlap_count={costs.get('overlap_count')}")
+                    continue
+                cost = float(costs["proxy_cost"])
+                label = "fast" if fast_scorer is not None else "proxy"
+                _debug(f"{name}[{cand_idx}]: {label}={cost:.6f} best_select={best_select_cost:.6f}")
+                if cost < best_select_cost:
+                    best_select_cost = cost
+                    best = candidate.detach().clone().float()
+                    best_name = f"{name}[{cand_idx}]"
         except Exception as exc:
             _debug(f"{name}: failed: {type(exc).__name__}")
             continue
@@ -207,7 +210,7 @@ def _run_global_place(
     *,
     steps: int,
     grid: int,
-) -> torch.Tensor:
+) -> torch.Tensor | list[torch.Tensor]:
     torch.manual_seed(config.seed)
 
     device = _device()
@@ -297,6 +300,16 @@ def _run_global_place(
     best_pos = pos.clone()
     best_score = float("inf")
     total_area = float((sizes[:n_hard, 0] * sizes[:n_hard, 1]).sum().item())
+    snapshot_topk = max(1, _env_int("OURS_ANALYTICAL_SNAPSHOT_TOPK", 1))
+    snapshot_period = max(1, _env_int("OURS_ANALYTICAL_SNAPSHOT_PERIOD", max(1, int(steps) // 8)))
+    snapshots: list[tuple[float, int, torch.Tensor]] = []
+
+    def remember_snapshot(score: float, iteration: int, candidate: torch.Tensor) -> None:
+        if snapshot_topk <= 1:
+            return
+        snapshots.append((float(score), int(iteration), candidate.detach().clone()))
+        snapshots.sort(key=lambda item: (item[0], item[1]))
+        del snapshots[snapshot_topk:]
 
     for it in range(int(steps)):
         frac = float(it) / max(1.0, float(steps - 1))
@@ -345,9 +358,17 @@ def _run_global_place(
             smooth_score = float(wl.item()) * (
                 1.0 + 5.0 * max(0.0, overflow - float(config.target_overflow))
             )
+            if _env_bool("OURS_ANALYTICAL_BEST_INCLUDE_CONG", "0") and congestion_lambda > 0.0:
+                smooth_score += (
+                    _env_float("OURS_ANALYTICAL_BEST_CONG_WEIGHT", 1.0)
+                    * float((congestion_lambda * cong_energy).item())
+                )
             if smooth_score < best_score:
                 best_score = smooth_score
                 best_pos = pos.detach().clone()
+                remember_snapshot(smooth_score, it, pos)
+            elif snapshot_topk > 1 and ((it + 1) % snapshot_period == 0 or it == int(steps) - 1):
+                remember_snapshot(smooth_score, it, pos)
 
         if it > 5:
             density_lambda = min(
@@ -358,7 +379,21 @@ def _run_global_place(
 
     result = benchmark.macro_positions.clone()
     result[:] = best_pos.detach().cpu()
-    return result.float()
+    if snapshot_topk <= 1:
+        return result.float()
+
+    remember_snapshot(best_score, int(steps), best_pos)
+    out: list[torch.Tensor] = []
+    seen: set[bytes] = set()
+    for _, _, snapshot in sorted(snapshots, key=lambda item: (item[0], item[1])):
+        candidate = benchmark.macro_positions.clone()
+        candidate[:] = snapshot.detach().cpu()
+        key = candidate[:n_hard].detach().cpu().numpy().round(4).tobytes()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(candidate.float())
+    return out or [result.float()]
 
 
 def _spiral_legalize_hard(
