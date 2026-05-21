@@ -34,6 +34,7 @@ class ValidityFirstPlacer:
         self.local_passes = _env_int("OURS_LOCAL_PASSES", 0)
         self.layout_candidates = _env_int("OURS_LAYOUT_CANDIDATES", 0)
         self.spectral_candidates = _env_int("OURS_SPECTRAL_CANDIDATES", 0)
+        self.partition_candidates = _env_int("OURS_PARTITION_CANDIDATES", 0)
         self.max_candidates = _env_int("OURS_MAX_CANDIDATES", 4)
         self.pin_candidates = _env_int("OURS_PIN_CANDIDATES", 0)
         self.selector_eps = _env_float("OURS_SELECTOR_EPS", 0.001)
@@ -212,6 +213,22 @@ class ValidityFirstPlacer:
                     _append_unique_candidate(candidates, f"spectral:{name}", candidate)
                     if len(candidates) > before:
                         spectral_added += 1
+
+        if self.optimize and self.partition_candidates > 0:
+            partition_added = 0
+            for name, seed in _partition_pack_candidates(
+                benchmark,
+                limit=self.partition_candidates,
+                gap=self.gap,
+            ):
+                if partition_added >= self.partition_candidates:
+                    break
+                candidate = _legalize_hard(seed, benchmark, gap=self.gap, max_rounds=700)
+                if _is_strictly_valid(candidate, benchmark):
+                    before = len(candidates)
+                    _append_unique_candidate(candidates, f"partition:{name}", candidate)
+                    if len(candidates) > before:
+                        partition_added += 1
 
         if self.optimize and self.steps > 0:
             data = _build_surrogate_data(benchmark, pin_aware=False)
@@ -1530,6 +1547,297 @@ def _map_spectral_axis_to_range(
             scaled = np.clip((axis - lo) / (hi - lo), 0.02, 0.98)
             mapped = lower + scaled * (upper - lower)
     return mapped
+
+
+def _partition_pack_candidates(
+    benchmark: Benchmark,
+    *,
+    limit: int,
+    gap: float,
+) -> list[tuple[str, torch.Tensor]]:
+    n_hard = int(benchmark.num_hard_macros)
+    if limit <= 0 or n_hard <= 1:
+        return []
+
+    movable = (
+        (benchmark.get_movable_mask() & benchmark.get_hard_macro_mask())[:n_hard]
+        .detach()
+        .cpu()
+        .numpy()
+        .astype(bool, copy=False)
+    )
+    movable_indices = np.where(movable)[0]
+    if len(movable_indices) <= 1:
+        return []
+
+    original = benchmark.macro_positions[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    axes = _partition_axes(benchmark, movable)
+    x_axis = _orient_spectral_axis(axes[0], original[:, 0], movable)
+    y_axis = _orient_spectral_axis(axes[1], original[:, 1], movable)
+    slices = max(2, _env_int("OURS_PARTITION_SLICES", 4))
+
+    specs: list[tuple[str, str, np.ndarray, np.ndarray]] = [
+        ("x_slices", "x_slices", x_axis, y_axis),
+        ("y_slices", "y_slices", y_axis, x_axis),
+        ("quad_xy", "quadrants", x_axis, y_axis),
+        ("quad_yx", "quadrants", y_axis, x_axis),
+        ("quad_flipx", "quadrants", -x_axis, y_axis),
+        ("quad_flipy", "quadrants", x_axis, -y_axis),
+        ("x_orig", "x_slices", original[:, 0], original[:, 1]),
+        ("y_orig", "y_slices", original[:, 1], original[:, 0]),
+    ]
+
+    out: list[tuple[str, torch.Tensor]] = []
+    for name, mode, primary, secondary in specs:
+        if mode == "x_slices":
+            seed = _partition_slice_seed(
+                benchmark,
+                movable_indices,
+                primary,
+                secondary,
+                slices=slices,
+                vertical=True,
+                gap=gap,
+            )
+        elif mode == "y_slices":
+            seed = _partition_slice_seed(
+                benchmark,
+                movable_indices,
+                primary,
+                secondary,
+                slices=slices,
+                vertical=False,
+                gap=gap,
+            )
+        else:
+            seed = _partition_quadrant_seed(
+                benchmark,
+                movable_indices,
+                primary,
+                secondary,
+                gap=gap,
+            )
+        out.append((name, seed))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _partition_axes(benchmark: Benchmark, movable: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    n_hard = int(benchmark.num_hard_macros)
+    original = benchmark.macro_positions[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    graph = np.zeros((n_hard, n_hard), dtype=np.float64)
+    for net_idx, nodes_t in enumerate(benchmark.net_nodes):
+        hard_nodes: list[int] = []
+        seen: set[int] = set()
+        for raw in nodes_t.tolist():
+            node = int(raw)
+            if 0 <= node < n_hard and node not in seen:
+                hard_nodes.append(node)
+                seen.add(node)
+        if len(hard_nodes) <= 1:
+            continue
+        net_weight = (
+            float(benchmark.net_weights[net_idx])
+            if len(getattr(benchmark, "net_weights", [])) > net_idx
+            else 1.0
+        )
+        pair_weight = net_weight / max(len(hard_nodes) * max(len(hard_nodes) - 1, 1), 1)
+        for a_i, a in enumerate(hard_nodes):
+            for b in hard_nodes[a_i + 1 :]:
+                graph[a, b] += pair_weight
+                graph[b, a] += pair_weight
+
+    degree = graph.sum(axis=1)
+    if int(((degree > 1e-12) & movable).sum()) <= 1:
+        return original[:, 0].copy(), original[:, 1].copy()
+
+    lap = np.diag(degree) - graph
+    try:
+        _, eigvecs = np.linalg.eigh(lap + np.eye(n_hard, dtype=np.float64) * 1e-9)
+    except np.linalg.LinAlgError:
+        return original[:, 0].copy(), original[:, 1].copy()
+    if eigvecs.shape[1] < 3:
+        return original[:, 0].copy(), original[:, 1].copy()
+    return eigvecs[:, 1].astype(np.float64, copy=True), eigvecs[:, 2].astype(np.float64, copy=True)
+
+
+def _partition_slice_seed(
+    benchmark: Benchmark,
+    movable_indices: np.ndarray,
+    primary: np.ndarray,
+    secondary: np.ndarray,
+    *,
+    slices: int,
+    vertical: bool,
+    gap: float,
+) -> torch.Tensor:
+    n_hard = int(benchmark.num_hard_macros)
+    sizes = benchmark.macro_sizes[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    cw = float(benchmark.canvas_width)
+    ch = float(benchmark.canvas_height)
+    groups = _axis_area_groups(movable_indices, primary, sizes, slices)
+    rects = []
+    if vertical:
+        width = cw / float(len(groups))
+        for idx in range(len(groups)):
+            rects.append((idx * width, 0.0, (idx + 1) * width, ch))
+    else:
+        height = ch / float(len(groups))
+        for idx in range(len(groups)):
+            rects.append((0.0, idx * height, cw, (idx + 1) * height))
+    return _pack_partition_groups(benchmark, groups, rects, secondary, gap=gap)
+
+
+def _partition_quadrant_seed(
+    benchmark: Benchmark,
+    movable_indices: np.ndarray,
+    x_axis: np.ndarray,
+    y_axis: np.ndarray,
+    *,
+    gap: float,
+) -> torch.Tensor:
+    cw = float(benchmark.canvas_width)
+    ch = float(benchmark.canvas_height)
+    x_med = float(np.median(x_axis[movable_indices]))
+    y_med = float(np.median(y_axis[movable_indices]))
+    groups: list[list[int]] = [[], [], [], []]
+    for idx in movable_indices.tolist():
+        gx = 1 if float(x_axis[idx]) >= x_med else 0
+        gy = 1 if float(y_axis[idx]) >= y_med else 0
+        groups[gy * 2 + gx].append(idx)
+    rects = [
+        (0.0, 0.0, cw * 0.5, ch * 0.5),
+        (cw * 0.5, 0.0, cw, ch * 0.5),
+        (0.0, ch * 0.5, cw * 0.5, ch),
+        (cw * 0.5, ch * 0.5, cw, ch),
+    ]
+    return _pack_partition_groups(benchmark, groups, rects, x_axis + y_axis, gap=gap)
+
+
+def _axis_area_groups(
+    indices: np.ndarray,
+    axis: np.ndarray,
+    sizes: np.ndarray,
+    count: int,
+) -> list[list[int]]:
+    count = max(1, min(int(count), len(indices)))
+    areas = sizes[:, 0] * sizes[:, 1]
+    ordered = sorted(indices.tolist(), key=lambda idx: (float(axis[idx]), -float(areas[idx])))
+    total = max(float(sum(areas[idx] for idx in ordered)), 1e-12)
+    target = total / float(count)
+    groups: list[list[int]] = [[] for _ in range(count)]
+    group_idx = 0
+    accum = 0.0
+    for idx in ordered:
+        if group_idx < count - 1 and groups[group_idx] and accum >= target:
+            group_idx += 1
+            accum = 0.0
+        groups[group_idx].append(idx)
+        accum += float(areas[idx])
+    return groups
+
+
+def _pack_partition_groups(
+    benchmark: Benchmark,
+    groups: list[list[int]],
+    rects: list[tuple[float, float, float, float]],
+    order_axis: np.ndarray,
+    *,
+    gap: float,
+) -> torch.Tensor:
+    out = benchmark.macro_positions.clone()
+    n_hard = int(benchmark.num_hard_macros)
+    sizes = benchmark.macro_sizes[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    fixed = benchmark.macro_fixed[:n_hard].detach().cpu().numpy().astype(bool, copy=False)
+    placed = _fixed_hard_boxes(benchmark, sizes)
+    areas = sizes[:, 0] * sizes[:, 1]
+    group_order = sorted(
+        range(len(groups)),
+        key=lambda group_idx: -sum(float(areas[idx]) for idx in groups[group_idx]),
+    )
+
+    for group_idx in group_order:
+        rect = rects[min(group_idx, len(rects) - 1)]
+        ordered = sorted(
+            [idx for idx in groups[group_idx] if not fixed[idx]],
+            key=lambda idx: (-float(areas[idx]), float(order_axis[idx])),
+        )
+        for idx in ordered:
+            pos = _find_partition_spot(idx, rect, placed, sizes, benchmark, gap=gap)
+            if pos is None:
+                pos = _find_partition_spot(
+                    idx,
+                    (0.0, 0.0, float(benchmark.canvas_width), float(benchmark.canvas_height)),
+                    placed,
+                    sizes,
+                    benchmark,
+                    gap=gap,
+                )
+            if pos is None:
+                continue
+            x, y = pos
+            out[idx, 0] = float(x)
+            out[idx, 1] = float(y)
+            half_w = float(sizes[idx, 0]) * 0.5
+            half_h = float(sizes[idx, 1]) * 0.5
+            placed.append((x - half_w, y - half_h, x + half_w, y + half_h))
+
+    out[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
+    _clamp_all(out, benchmark)
+    return out
+
+
+def _fixed_hard_boxes(benchmark: Benchmark, sizes: np.ndarray) -> list[tuple[float, float, float, float]]:
+    n_hard = int(benchmark.num_hard_macros)
+    fixed = benchmark.macro_fixed[:n_hard].detach().cpu().numpy().astype(bool, copy=False)
+    pos = benchmark.macro_positions[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    boxes: list[tuple[float, float, float, float]] = []
+    for idx in np.where(fixed)[0].tolist():
+        half_w = float(sizes[idx, 0]) * 0.5
+        half_h = float(sizes[idx, 1]) * 0.5
+        x, y = float(pos[idx, 0]), float(pos[idx, 1])
+        boxes.append((x - half_w, y - half_h, x + half_w, y + half_h))
+    return boxes
+
+
+def _find_partition_spot(
+    idx: int,
+    rect: tuple[float, float, float, float],
+    placed: list[tuple[float, float, float, float]],
+    sizes: np.ndarray,
+    benchmark: Benchmark,
+    *,
+    gap: float,
+) -> tuple[float, float] | None:
+    half_w = float(sizes[idx, 0]) * 0.5
+    half_h = float(sizes[idx, 1]) * 0.5
+    margin = max(float(gap), _env_float("OURS_BOUNDARY_MARGIN", 1e-4))
+    lo_x = max(float(rect[0]) + half_w + margin, half_w + margin)
+    hi_x = min(float(rect[2]) - half_w - margin, float(benchmark.canvas_width) - half_w - margin)
+    lo_y = max(float(rect[1]) + half_h + margin, half_h + margin)
+    hi_y = min(float(rect[3]) - half_h - margin, float(benchmark.canvas_height) - half_h - margin)
+    if lo_x > hi_x or lo_y > hi_y:
+        return None
+
+    x_candidates = [lo_x, hi_x, (lo_x + hi_x) * 0.5]
+    y_candidates = [lo_y, hi_y, (lo_y + hi_y) * 0.5]
+    for box in placed:
+        x_candidates.extend((float(box[0]) - gap - half_w, float(box[2]) + gap + half_w))
+        y_candidates.extend((float(box[1]) - gap - half_h, float(box[3]) + gap + half_h))
+    x_values = sorted({round(float(np.clip(x, lo_x, hi_x)), 6) for x in x_candidates})
+    y_values = sorted({round(float(np.clip(y, lo_y, hi_y)), 6) for y in y_candidates})
+    center_x = (lo_x + hi_x) * 0.5
+    center_y = (lo_y + hi_y) * 0.5
+    pairs = sorted(
+        ((x, y) for y in y_values for x in x_values),
+        key=lambda item: (abs(item[0] - center_x) + abs(item[1] - center_y), item[1], item[0]),
+    )
+    for x, y in pairs:
+        box = (x - half_w, y - half_h, x + half_w, y + half_h)
+        if not any(_boxes_overlap(box, other, gap=gap) for other in placed):
+            return float(x), float(y)
+    return None
 
 
 def _scale_about_center(
