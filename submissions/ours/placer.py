@@ -35,6 +35,7 @@ class ValidityFirstPlacer:
         self.layout_candidates = _env_int("OURS_LAYOUT_CANDIDATES", 0)
         self.spectral_candidates = _env_int("OURS_SPECTRAL_CANDIDATES", 0)
         self.partition_candidates = _env_int("OURS_PARTITION_CANDIDATES", 0)
+        self.evac_candidates = _env_int("OURS_EVAC_CANDIDATES", 0)
         self.max_candidates = _env_int("OURS_MAX_CANDIDATES", 4)
         self.pin_candidates = _env_int("OURS_PIN_CANDIDATES", 0)
         self.selector_eps = _env_float("OURS_SELECTOR_EPS", 0.001)
@@ -229,6 +230,23 @@ class ValidityFirstPlacer:
                     _append_unique_candidate(candidates, f"partition:{name}", candidate)
                     if len(candidates) > before:
                         partition_added += 1
+
+        if self.optimize and self.evac_candidates > 0 and candidates:
+            evac_added = 0
+            for name, seed in _evacuation_candidates(
+                benchmark,
+                candidates[0][1],
+                limit=self.evac_candidates,
+                gap=self.gap,
+            ):
+                if evac_added >= self.evac_candidates:
+                    break
+                candidate = _legalize_hard(seed, benchmark, gap=self.gap, max_rounds=700)
+                if _is_strictly_valid(candidate, benchmark):
+                    before = len(candidates)
+                    _append_unique_candidate(candidates, f"evac:{name}", candidate)
+                    if len(candidates) > before:
+                        evac_added += 1
 
         if self.optimize and self.steps > 0:
             data = _build_surrogate_data(benchmark, pin_aware=False)
@@ -1838,6 +1856,188 @@ def _find_partition_spot(
         if not any(_boxes_overlap(box, other, gap=gap) for other in placed):
             return float(x), float(y)
     return None
+
+
+def _evacuation_candidates(
+    benchmark: Benchmark,
+    base: torch.Tensor,
+    *,
+    limit: int,
+    gap: float,
+) -> list[tuple[str, torch.Tensor]]:
+    if limit <= 0:
+        return []
+    plc = _load_plc(benchmark)
+    if plc is None:
+        return []
+    try:
+        helper_dir = Path(__file__).resolve().parent
+        if str(helper_dir) not in sys.path:
+            sys.path.insert(0, str(helper_dir))
+        from fast_proxy import build_fast_proxy
+    except Exception:
+        return []
+    scorer = build_fast_proxy(benchmark, plc)
+    if scorer is None:
+        return []
+
+    legal_base = _legalize_hard(base.detach().clone().float(), benchmark, gap=gap, max_rounds=700)
+    if not _is_strictly_valid(legal_base, benchmark):
+        return []
+    try:
+        maps = scorer.score(legal_base, maps=True)
+        pressure = np.asarray(maps["v_routing_cong"], dtype=np.float64) + np.asarray(
+            maps["h_routing_cong"], dtype=np.float64
+        )
+    except Exception:
+        return []
+    if pressure.size == 0:
+        return []
+
+    n_hard = int(benchmark.num_hard_macros)
+    sizes = benchmark.macro_sizes[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    fixed = benchmark.macro_fixed[:n_hard].detach().cpu().numpy().astype(bool, copy=False)
+    base_np = legal_base[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    hot_order = _evacuation_hot_macros(base_np, sizes, fixed, scorer, pressure)
+    if not hot_order:
+        return []
+
+    cold_cells = _evacuation_cold_cells(scorer, pressure, count=_env_int("OURS_EVAC_COLD_CELLS", 96))
+    specs = [
+        ("hot4", 4, 0),
+        ("hot8", 8, 3),
+        ("hot12", 12, 9),
+        ("hot6_offset", 6, 17),
+        ("hot10_offset", 10, 29),
+        ("hot16", 16, 41),
+    ]
+    out: list[tuple[str, torch.Tensor]] = []
+    for name, move_count, offset in specs:
+        seed = _evacuation_seed(
+            benchmark,
+            legal_base,
+            sizes,
+            fixed,
+            hot_order[: max(1, min(move_count, len(hot_order)))],
+            cold_cells,
+            scorer,
+            gap=gap,
+            offset=offset,
+        )
+        if seed is None:
+            continue
+        out.append((name, seed))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _evacuation_hot_macros(
+    pos: np.ndarray,
+    sizes: np.ndarray,
+    fixed: np.ndarray,
+    scorer,
+    pressure: np.ndarray,
+) -> list[int]:
+    ranked: list[tuple[float, int]] = []
+    for idx in range(scorer.num_hard):
+        if fixed[idx]:
+            continue
+        bins = _evacuation_covered_bins(
+            scorer,
+            float(pos[idx, 0]),
+            float(pos[idx, 1]),
+            float(sizes[idx, 0]),
+            float(sizes[idx, 1]),
+        )
+        if not bins:
+            row, col = scorer._grid_cell(float(pos[idx, 0]), float(pos[idx, 1]))
+            bins = [row * scorer.grid_cols + col]
+        vals = pressure[np.asarray(bins, dtype=np.int64)]
+        area = float(sizes[idx, 0] * sizes[idx, 1])
+        score = float(vals.max()) + 0.5 * float(vals.mean()) + 0.01 * np.log1p(area)
+        ranked.append((score, idx))
+    ranked.sort(reverse=True)
+    return [idx for _, idx in ranked]
+
+
+def _evacuation_covered_bins(scorer, x: float, y: float, w: float, h: float) -> list[int]:
+    x_min = float(x) - 0.5 * float(w)
+    x_max = float(x) + 0.5 * float(w)
+    y_min = float(y) - 0.5 * float(h)
+    y_max = float(y) + 0.5 * float(h)
+    bl_row, bl_col = scorer._grid_cell(x_min, y_min)
+    ur_row, ur_col = scorer._grid_cell(x_max, y_max)
+    bins: list[int] = []
+    for row in range(bl_row, ur_row + 1):
+        for col in range(bl_col, ur_col + 1):
+            bins.append(row * scorer.grid_cols + col)
+    return bins
+
+
+def _evacuation_cold_cells(scorer, pressure: np.ndarray, *, count: int) -> list[tuple[int, int]]:
+    count = max(1, min(int(count), int(pressure.size)))
+    order = np.argpartition(pressure, count - 1)[:count]
+    order = order[np.argsort(pressure[order])]
+    cells: list[tuple[int, int]] = []
+    for flat in order.tolist():
+        cells.append((int(flat // scorer.grid_cols), int(flat % scorer.grid_cols)))
+    return cells
+
+
+def _evacuation_seed(
+    benchmark: Benchmark,
+    base: torch.Tensor,
+    sizes: np.ndarray,
+    fixed: np.ndarray,
+    hot_indices: list[int],
+    cold_cells: list[tuple[int, int]],
+    scorer,
+    *,
+    gap: float,
+    offset: int,
+) -> torch.Tensor | None:
+    out = base.detach().clone().float()
+    placed = _fixed_hard_boxes(benchmark, sizes)
+    base_np = base[: int(benchmark.num_hard_macros)].detach().cpu().numpy().astype(np.float64, copy=False)
+    moving = set(int(idx) for idx in hot_indices)
+    for idx in range(int(benchmark.num_hard_macros)):
+        if fixed[idx] or idx in moving:
+            continue
+        half_w = float(sizes[idx, 0]) * 0.5
+        half_h = float(sizes[idx, 1]) * 0.5
+        x = float(base_np[idx, 0])
+        y = float(base_np[idx, 1])
+        placed.append((x - half_w, y - half_h, x + half_w, y + half_h))
+
+    if not cold_cells:
+        return None
+    for move_idx, idx in enumerate(hot_indices):
+        found = None
+        for probe_idx in range(len(cold_cells)):
+            row, col = cold_cells[(probe_idx + offset + move_idx * 7) % len(cold_cells)]
+            cx = (float(col) + 0.5) * scorer.grid_width
+            cy = (float(row) + 0.5) * scorer.grid_height
+            rect = (
+                cx - scorer.grid_width * 1.5,
+                cy - scorer.grid_height * 1.5,
+                cx + scorer.grid_width * 1.5,
+                cy + scorer.grid_height * 1.5,
+            )
+            found = _find_partition_spot(idx, rect, placed, sizes, benchmark, gap=gap)
+            if found is not None:
+                break
+        if found is None:
+            continue
+        x, y = found
+        out[idx, 0] = float(x)
+        out[idx, 1] = float(y)
+        half_w = float(sizes[idx, 0]) * 0.5
+        half_h = float(sizes[idx, 1]) * 0.5
+        placed.append((x - half_w, y - half_h, x + half_w, y + half_h))
+    out[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
+    _clamp_all(out, benchmark)
+    return out
 
 
 def _scale_about_center(
