@@ -67,6 +67,10 @@ class ValidityFirstPlacer:
         if not candidates:
             return _row_pack_fallback(benchmark, gap=max(self.gap, 0.001))
 
+        forced = _forced_candidate(candidates)
+        if forced is not None:
+            return self._refine_selected(forced, benchmark)
+
         if self.exact_select and len(candidates) > 1:
             selected = _select_by_proxy(candidates, benchmark)
             if selected is not None:
@@ -386,6 +390,22 @@ def _append_unique_candidate(
         if torch.allclose(existing, placement, atol=1e-5, rtol=0.0):
             return
     candidates.append((name, placement))
+
+
+def _forced_candidate(candidates: list[tuple[str, torch.Tensor]]) -> torch.Tensor | None:
+    exact_name = _env("OURS_FORCE_CANDIDATE", "").strip()
+    if exact_name:
+        for name, placement in candidates:
+            if name == exact_name:
+                return placement.detach().clone().float()
+
+    prefix = _env("OURS_FORCE_CANDIDATE_PREFIX", "").strip()
+    if prefix:
+        for name, placement in candidates:
+            if name.startswith(prefix):
+                return placement.detach().clone().float()
+
+    return None
 
 
 def _build_surrogate_data(
