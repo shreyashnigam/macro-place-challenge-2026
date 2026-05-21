@@ -333,7 +333,7 @@ def _benchmark_profile(name: str) -> dict[str, str]:
             **high_cong,
             "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "8.00",
             "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.50",
-            "OURS_SOFT_SEARCH_SEED": "20261318",
+            "OURS_SOFT_SEARCH_SEED": "20261618",
         },
     }
     return profiles.get(name, {})
