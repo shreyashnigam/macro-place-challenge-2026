@@ -54,6 +54,59 @@ def refine_with_fast_search(
     eps = _env_float("OURS_FAST_SEARCH_EPS", 1e-5)
     gap = _env_float("OURS_FAST_SEARCH_GAP", _env_float("OURS_GAP", 0.005))
     rng = np.random.default_rng(_env_int("OURS_FAST_SEARCH_SEED", 20260519))
+    exact_topk = max(0, _env_int("OURS_FAST_SEARCH_EXACT_TOPK", 0))
+    exact_pool_limit = max(exact_topk, _env_int("OURS_FAST_SEARCH_EXACT_POOL", max(32, exact_topk * 8)))
+    exact_pool: list[tuple[float, torch.Tensor]] = []
+    base_exact_cost: float | None = None
+    best_exact_cost: float | None = None
+    best_exact: torch.Tensor | None = None
+
+    if exact_topk > 0:
+        try:
+            base_exact = compute_proxy_cost(best.detach().float(), benchmark, plc)
+            if int(base_exact.get("overlap_count", 1)) == 0:
+                base_exact_cost = float(base_exact["proxy_cost"])
+                best_exact_cost = base_exact_cost
+                best_exact = best.detach().clone().float()
+        except Exception:
+            exact_topk = 0
+
+    def remember_exact_candidate(candidate: torch.Tensor, fast_cost: float) -> None:
+        if exact_topk <= 0:
+            return
+        exact_pool.append((float(fast_cost), candidate.detach().clone().float()))
+        if len(exact_pool) > exact_pool_limit * 2:
+            exact_pool.sort(key=lambda item: item[0])
+            del exact_pool[exact_pool_limit:]
+
+    def check_exact_pool(label: str) -> bool:
+        nonlocal best_exact_cost, best_exact
+        if exact_topk <= 0 or base_exact_cost is None or not exact_pool:
+            return False
+        exact_pool.sort(key=lambda item: item[0])
+        improved = False
+        checked = 0
+        for fast_cost, candidate in exact_pool[:exact_topk]:
+            if not is_valid(candidate, benchmark):
+                continue
+            try:
+                costs = compute_proxy_cost(candidate.detach().float(), benchmark, plc)
+            except Exception:
+                continue
+            if int(costs.get("overlap_count", 1)) != 0:
+                continue
+            exact_cost = float(costs["proxy_cost"])
+            checked += 1
+            if best_exact_cost is None or exact_cost < best_exact_cost - eps:
+                best_exact_cost = exact_cost
+                best_exact = candidate.detach().clone().float()
+                improved = True
+                _debug(
+                    f"exact-rescue {label} exact={exact_cost:.6f} "
+                    f"fast={fast_cost:.6f} checked={checked}"
+                )
+        del exact_pool[:]
+        return improved
 
     _debug(f"start fast={best_fast:.6f}")
     if _env_bool("OURS_FAST_SEARCH_LNS", "0") and legalize_hard is not None:
@@ -117,6 +170,7 @@ def refine_with_fast_search(
                 if int(fast.get("overlap_count", 1)) != 0:
                     continue
                 cost = float(fast["proxy_cost"])
+                remember_exact_candidate(candidate, cost)
                 if cost + eps < round_best_fast:
                     round_best = candidate
                     round_best_fast = cost
@@ -145,11 +199,21 @@ def refine_with_fast_search(
             if int(fast.get("overlap_count", 1)) != 0:
                 continue
             cost = float(fast["proxy_cost"])
+            remember_exact_candidate(candidate, cost)
             if cost + eps < round_best_fast:
                 round_best = candidate
                 round_best_fast = cost
 
+        exact_improved = check_exact_pool(f"round:{round_idx}")
         if round_best is best or round_best_fast + eps >= best_fast:
+            if exact_improved and best_exact is not None:
+                best = best_exact.detach().clone().float()
+                best_fast = float(scorer.score(best)["proxy_cost"])
+                _debug(
+                    f"round={round_idx} exact-rescue accepted fast={best_fast:.6f} "
+                    f"exact={best_exact_cost:.6f}"
+                )
+                continue
             _debug(f"round={round_idx} no_improve trials={trials} fast={best_fast:.6f}")
             break
         best = round_best
@@ -163,21 +227,33 @@ def refine_with_fast_search(
 
     try:
         base_exact = compute_proxy_cost(baseline, benchmark, plc)
-        best_exact = compute_proxy_cost(best, benchmark, plc)
+        best_costs = compute_proxy_cost(best, benchmark, plc)
     except Exception:
         return baseline
-    if int(best_exact.get("overlap_count", 1)) != 0:
+    if int(best_costs.get("overlap_count", 1)) != 0:
         return baseline
-    if float(best_exact["proxy_cost"]) < float(base_exact["proxy_cost"]) - eps:
+    if float(best_costs["proxy_cost"]) < float(base_exact["proxy_cost"]) - eps:
         _debug(
             "accepted exact "
-            f"{float(base_exact['proxy_cost']):.6f}->{float(best_exact['proxy_cost']):.6f} "
+            f"{float(base_exact['proxy_cost']):.6f}->{float(best_costs['proxy_cost']):.6f} "
             f"fast={best_fast:.6f}"
         )
         return best.detach().clone().float()
+    if (
+        exact_topk > 0
+        and best_exact is not None
+        and best_exact_cost is not None
+        and base_exact_cost is not None
+        and best_exact_cost < base_exact_cost - eps
+    ):
+        _debug(
+            "accepted exact-rescue "
+            f"{base_exact_cost:.6f}->{best_exact_cost:.6f}"
+        )
+        return best_exact.detach().clone().float()
     _debug(
         "rejected exact "
-        f"{float(base_exact['proxy_cost']):.6f}->{float(best_exact['proxy_cost']):.6f} "
+        f"{float(base_exact['proxy_cost']):.6f}->{float(best_costs['proxy_cost']):.6f} "
         f"fast={best_fast:.6f}"
     )
     return baseline
