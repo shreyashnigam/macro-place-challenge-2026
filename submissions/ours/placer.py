@@ -17,7 +17,6 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
-import hashlib
 from typing import Iterable
 
 import numpy as np
@@ -366,33 +365,50 @@ def _adaptive_profile(benchmark: Benchmark) -> dict[str, str]:
     fanout_heavy = max_hard_net_degree >= 10
 
     profile: dict[str, str] = {
-        "OURS_SOFT_SEARCH_SEED": str(_feature_seed(benchmark, features)),
         "OURS_SOFT_SEARCH_BULK": "1",
         "OURS_SOFT_SEARCH_PORTFOLIO": "0",
-        "OURS_EXACT_SELECT": "1",
         "OURS_SELECTOR_EPS": "0.006",
     }
 
-    if large or hard_dense or hard_sparse:
+    if large or hard_dense or hard_sparse or graph_activity <= 0.45:
         profile.update(analytical_heavy)
     if hard_dense or hard_sparse or fanout_heavy or grid_cells >= 1800:
         profile.update(high_cong)
 
-    route_weight = 4.0
+    route_weight: float | None = 4.0
     density_weight = 0.5
-    if hard_sparse:
+    if graph_activity <= 0.45 and avg_hard_net_degree <= 1.15:
         route_weight = 8.0
         density_weight = 0.5
-    elif hard_dense:
-        route_weight = 6.0
+    elif hard_sparse and hard_density <= 0.12:
+        route_weight = 8.0
+        density_weight = 0.5
+    elif hard_sparse and (movable_hard >= 700 or soft_count >= 1750):
+        route_weight = 8.0
         density_weight = 1.0
+        profile["OURS_SOFT_SEARCH_TRIALS"] = "250000"
+        profile["OURS_SOFT_SEARCH_TIMEOUT"] = "3300"
+    elif hard_sparse and movable_hard >= 500:
+        route_weight = 0.0
+        density_weight = 0.0
+        profile["OURS_ANALYTICAL_CONG_WEIGHT"] = "0.070"
+    elif hard_dense:
+        if very_large and max_hard_net_degree < 12:
+            route_weight = None
+        elif very_large:
+            route_weight = 0.0
+            density_weight = 0.5
+        else:
+            route_weight = 4.0
+            density_weight = 1.0
     elif all_density >= 0.72 and avg_hard_net_degree <= 1.25:
         route_weight = 0.0
         density_weight = 0.5
     elif fanout_heavy:
         route_weight = 4.0
         density_weight = 0.5
-    profile["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = f"{route_weight:.2f}"
+    if route_weight is not None:
+        profile["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = f"{route_weight:.2f}"
     profile["OURS_SOFT_SEARCH_DENSITY_WEIGHT"] = f"{density_weight:.2f}"
 
     if large and graph_rich:
@@ -402,11 +418,11 @@ def _adaptive_profile(benchmark: Benchmark) -> dict[str, str]:
         profile["OURS_LAYOUT_CANDIDATES"] = "3"
 
     if very_large:
-        profile["OURS_SOFT_SEARCH_TRIALS"] = "160000"
-        profile["OURS_SOFT_SEARCH_TIMEOUT"] = "3300"
+        profile.setdefault("OURS_SOFT_SEARCH_TRIALS", "160000")
+        profile.setdefault("OURS_SOFT_SEARCH_TIMEOUT", "3300")
     elif large:
-        profile["OURS_SOFT_SEARCH_TRIALS"] = "120000"
-        profile["OURS_SOFT_SEARCH_TIMEOUT"] = "2800"
+        profile.setdefault("OURS_SOFT_SEARCH_TRIALS", "120000")
+        profile.setdefault("OURS_SOFT_SEARCH_TIMEOUT", "2800")
 
     return profile
 
@@ -439,21 +455,6 @@ def _profile_features(benchmark: Benchmark) -> dict[str, float]:
         "avg_hard_net_degree": float(np.mean(hard_net_degrees)) if hard_net_degrees else 0.0,
         "max_hard_net_degree": float(max(hard_net_degrees)) if hard_net_degrees else 0.0,
     }
-
-
-def _feature_seed(benchmark: Benchmark, features: dict[str, float]) -> int:
-    h = hashlib.blake2b(digest_size=8)
-    h.update(str(int(benchmark.num_macros)).encode())
-    h.update(str(int(benchmark.num_hard_macros)).encode())
-    for key in sorted(features):
-        h.update(f"{key}:{features[key]:.6g};".encode())
-    sizes = benchmark.macro_sizes.detach().cpu().numpy().astype(np.float32, copy=False)
-    if sizes.size:
-        sample = sizes[: min(len(sizes), 256)].copy()
-        h.update(sample.tobytes())
-    for nodes_t in benchmark.net_nodes[: min(len(benchmark.net_nodes), 512)]:
-        h.update(str(len(nodes_t)).encode())
-    return 20260000 + (int.from_bytes(h.digest(), "little") % 1000000)
 
 
 def _env(name: str, default: str) -> str:
