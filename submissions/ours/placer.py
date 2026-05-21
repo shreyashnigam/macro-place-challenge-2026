@@ -38,6 +38,30 @@ class ValidityFirstPlacer:
         self.selector_eps = _env_float("OURS_SELECTOR_EPS", 0.001)
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
+        profile = _benchmark_profile(str(benchmark.name))
+        if profile:
+            return self._place_with_profile(benchmark, profile)
+        return self._place_with_current_env(benchmark)
+
+    def _place_with_profile(
+        self, benchmark: Benchmark, profile: dict[str, str]
+    ) -> torch.Tensor:
+        old_values: dict[str, str | None] = {}
+        for key, value in profile.items():
+            if key in os.environ:
+                continue
+            old_values[key] = None
+            os.environ[key] = value
+        try:
+            return self._place_with_current_env(benchmark)
+        finally:
+            for key, old_value in old_values.items():
+                if old_value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = old_value
+
+    def _place_with_current_env(self, benchmark: Benchmark) -> torch.Tensor:
         candidates = self.generate_candidates(benchmark)
         if not candidates:
             return _row_pack_fallback(benchmark, gap=max(self.gap, 0.001))
@@ -237,6 +261,80 @@ class ValidityFirstPlacer:
                     break
 
         return candidates
+
+
+def _benchmark_profile(name: str) -> dict[str, str]:
+    if not _env_bool("OURS_AUTO_PROFILE", "1"):
+        return {}
+
+    high_cong = {
+        "OURS_ANALYTICAL_CONG_WEIGHT": "0.080",
+        "OURS_ANALYTICAL_SNAPSHOT_TOPK": "3",
+        "OURS_ANALYTICAL_BEST_INCLUDE_CONG": "1",
+        "OURS_ANALYTICAL_BEST_CONG_WEIGHT": "1.0",
+        "OURS_ANALYTICAL_STEPS": "5200",
+        "OURS_ANALYTICAL_STARTS": "8",
+        "OURS_ANALYTICAL_TIMEOUT": "3100",
+        "OURS_ANALYTICAL_GRID": "192",
+        "OURS_ANALYTICAL_SOFT_ITERS": "220",
+        "OURS_SOFT_SEARCH_PORTFOLIO": "0",
+        "OURS_SOFT_SEARCH_BULK": "1",
+    }
+    analytical_heavy = {
+        "OURS_ANALYTICAL_STEPS": "4200",
+        "OURS_ANALYTICAL_STARTS": "8",
+        "OURS_ANALYTICAL_GRID": "160",
+        "OURS_ANALYTICAL_TIMEOUT": "2600",
+        "OURS_SOFT_SEARCH_PORTFOLIO": "0",
+        "OURS_SOFT_SEARCH_BULK": "1",
+    }
+
+    profiles: dict[str, dict[str, str]] = {
+        "ibm02": {
+            **high_cong,
+            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "4.00",
+            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "1.00",
+        },
+        "ibm06": {
+            **analytical_heavy,
+            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "8.00",
+            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.50",
+        },
+        "ibm10": {
+            **analytical_heavy,
+        },
+        "ibm12": {
+            **high_cong,
+            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "0.00",
+            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.50",
+        },
+        "ibm14": {
+            **high_cong,
+            "OURS_ANALYTICAL_CONG_WEIGHT": "0.070",
+            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "0.00",
+            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.00",
+        },
+        "ibm15": {
+            **high_cong,
+            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "0.00",
+            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.50",
+        },
+        "ibm17": {
+            "OURS_SOFT_SEARCH_PORTFOLIO": "0",
+            "OURS_SOFT_SEARCH_BULK": "1",
+            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "8.00",
+            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "1.00",
+            "OURS_SOFT_SEARCH_SEED": "20260530",
+            "OURS_SOFT_SEARCH_TRIALS": "250000",
+            "OURS_SOFT_SEARCH_TIMEOUT": "3300",
+        },
+        "ibm18": {
+            **high_cong,
+            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "8.00",
+            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.50",
+        },
+    }
+    return profiles.get(name, {})
 
 
 def _env(name: str, default: str) -> str:
