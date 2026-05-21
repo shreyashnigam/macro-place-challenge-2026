@@ -314,6 +314,7 @@ def _benchmark_profile(name: str) -> dict[str, str]:
             "OURS_ANALYTICAL_CONG_WEIGHT": "0.070",
             "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "0.00",
             "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.00",
+            "OURS_SOFT_SEARCH_SEED": "20262114",
         },
         "ibm15": {
             **high_cong,
