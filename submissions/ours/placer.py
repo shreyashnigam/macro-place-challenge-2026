@@ -362,6 +362,8 @@ def _benchmark_profile(name: str) -> dict[str, str]:
         },
         "ibm12": {
             **high_cong,
+            "OURS_SPECTRAL_CANDIDATES": "1",
+            "OURS_FORCE_CANDIDATE": "spectral:xy",
             "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "0.00",
             "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.50",
         },
