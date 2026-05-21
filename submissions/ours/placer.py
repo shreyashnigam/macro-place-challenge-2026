@@ -33,6 +33,7 @@ class ValidityFirstPlacer:
         self.exact_select = _env_bool("OURS_EXACT_SELECT", "0")
         self.local_passes = _env_int("OURS_LOCAL_PASSES", 0)
         self.layout_candidates = _env_int("OURS_LAYOUT_CANDIDATES", 0)
+        self.spectral_candidates = _env_int("OURS_SPECTRAL_CANDIDATES", 0)
         self.max_candidates = _env_int("OURS_MAX_CANDIDATES", 4)
         self.pin_candidates = _env_int("OURS_PIN_CANDIDATES", 0)
         self.selector_eps = _env_float("OURS_SELECTOR_EPS", 0.001)
@@ -191,6 +192,22 @@ class ValidityFirstPlacer:
                     _append_unique_candidate(candidates, f"layout:{name}", candidate)
                     if len(candidates) > before:
                         layout_added += 1
+
+        if self.optimize and self.spectral_candidates > 0:
+            spectral_added = 0
+            for name, seed in _spectral_hard_candidates(
+                benchmark,
+                limit=self.spectral_candidates,
+                gap=self.gap,
+            ):
+                if spectral_added >= self.spectral_candidates:
+                    break
+                candidate = _legalize_hard(seed, benchmark, gap=self.gap, max_rounds=500)
+                if _is_strictly_valid(candidate, benchmark):
+                    before = len(candidates)
+                    _append_unique_candidate(candidates, f"spectral:{name}", candidate)
+                    if len(candidates) > before:
+                        spectral_added += 1
 
         if self.optimize and self.steps > 0:
             data = _build_surrogate_data(benchmark, pin_aware=False)
@@ -1347,6 +1364,152 @@ def _load_plc(benchmark: Benchmark):
         except Exception:
             return None
     return None
+
+
+def _spectral_hard_candidates(
+    benchmark: Benchmark,
+    *,
+    limit: int,
+    gap: float,
+) -> list[tuple[str, torch.Tensor]]:
+    n_hard = int(benchmark.num_hard_macros)
+    if limit <= 0 or n_hard <= 2:
+        return []
+    hard_mask = benchmark.get_hard_macro_mask()
+    movable = (benchmark.get_movable_mask() & hard_mask)[:n_hard].detach().cpu().numpy().astype(bool, copy=False)
+    if int(movable.sum()) <= 1:
+        return []
+
+    graph = np.zeros((n_hard, n_hard), dtype=np.float64)
+    for net_idx, nodes_t in enumerate(benchmark.net_nodes):
+        hard_nodes: list[int] = []
+        seen: set[int] = set()
+        for raw in nodes_t.tolist():
+            node = int(raw)
+            if 0 <= node < n_hard and node not in seen:
+                hard_nodes.append(node)
+                seen.add(node)
+        if len(hard_nodes) <= 1:
+            continue
+        net_weight = (
+            float(benchmark.net_weights[net_idx])
+            if len(getattr(benchmark, "net_weights", [])) > net_idx
+            else 1.0
+        )
+        weight = net_weight / max(len(hard_nodes) - 1, 1)
+        if len(hard_nodes) <= 40:
+            pair_weight = weight / max(len(hard_nodes), 1)
+            for a_i, a in enumerate(hard_nodes):
+                for b in hard_nodes[a_i + 1 :]:
+                    graph[a, b] += pair_weight
+                    graph[b, a] += pair_weight
+        else:
+            for a_i, a in enumerate(hard_nodes):
+                b = hard_nodes[(a_i + 1) % len(hard_nodes)]
+                if a != b:
+                    graph[a, b] += weight
+                    graph[b, a] += weight
+
+    degree = graph.sum(axis=1)
+    active = degree > 1e-12
+    if int((active & movable).sum()) <= 1:
+        return []
+
+    lap = np.diag(degree) - graph
+    try:
+        _, eigvecs = np.linalg.eigh(lap + np.eye(n_hard, dtype=np.float64) * 1e-9)
+    except np.linalg.LinAlgError:
+        return []
+    axes = [eigvecs[:, idx].astype(np.float64, copy=True) for idx in range(1, min(n_hard, 5))]
+    if len(axes) < 2:
+        return []
+
+    original = benchmark.macro_positions[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    axis_x = _orient_spectral_axis(axes[0], original[:, 0], movable)
+    axis_y = _orient_spectral_axis(axes[1], original[:, 1], movable)
+
+    specs: list[tuple[str, np.ndarray, np.ndarray]] = [
+        ("xy", axis_x, axis_y),
+        ("yx", axis_y, axis_x),
+        ("flipx", -axis_x, axis_y),
+        ("flipy", axis_x, -axis_y),
+        ("flipxy", -axis_x, -axis_y),
+    ]
+    if len(axes) >= 3:
+        axis_z = _orient_spectral_axis(axes[2], original[:, 0] + original[:, 1], movable)
+        specs.extend(
+            [
+                ("xz", axis_x, axis_z),
+                ("zy", axis_z, axis_y),
+                ("zx", axis_z, axis_x),
+            ]
+        )
+
+    out: list[tuple[str, torch.Tensor]] = []
+    for name, x_axis, y_axis in specs:
+        seed = _spectral_seed_from_axes(benchmark, x_axis, y_axis, movable, gap=gap)
+        out.append((name, seed))
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _orient_spectral_axis(axis: np.ndarray, reference: np.ndarray, movable: np.ndarray) -> np.ndarray:
+    out = axis.astype(np.float64, copy=True)
+    mask = movable & np.isfinite(out) & np.isfinite(reference)
+    if int(mask.sum()) >= 2:
+        centered_axis = out[mask] - float(out[mask].mean())
+        centered_ref = reference[mask] - float(reference[mask].mean())
+        if float(np.dot(centered_axis, centered_ref)) < 0.0:
+            out = -out
+    return out
+
+
+def _spectral_seed_from_axes(
+    benchmark: Benchmark,
+    x_axis: np.ndarray,
+    y_axis: np.ndarray,
+    movable: np.ndarray,
+    *,
+    gap: float,
+) -> torch.Tensor:
+    out = benchmark.macro_positions.clone()
+    n_hard = int(benchmark.num_hard_macros)
+    sizes = benchmark.macro_sizes[:n_hard].detach().cpu().numpy().astype(np.float64, copy=False)
+    margin = max(float(gap), _env_float("OURS_BOUNDARY_MARGIN", 1e-4))
+    x_min = sizes[:, 0] * 0.5 + margin
+    x_max = float(benchmark.canvas_width) - sizes[:, 0] * 0.5 - margin
+    y_min = sizes[:, 1] * 0.5 + margin
+    y_max = float(benchmark.canvas_height) - sizes[:, 1] * 0.5 - margin
+    x_min = np.minimum(x_min, x_max)
+    y_min = np.minimum(y_min, y_max)
+
+    mapped_x = _map_spectral_axis_to_range(x_axis, x_min, x_max, movable)
+    mapped_y = _map_spectral_axis_to_range(y_axis, y_min, y_max, movable)
+    for idx in np.where(movable)[0].tolist():
+        out[idx, 0] = float(mapped_x[idx])
+        out[idx, 1] = float(mapped_y[idx])
+    out[benchmark.macro_fixed] = benchmark.macro_positions[benchmark.macro_fixed]
+    _clamp_all(out, benchmark)
+    return out
+
+
+def _map_spectral_axis_to_range(
+    axis: np.ndarray,
+    lower: np.ndarray,
+    upper: np.ndarray,
+    movable: np.ndarray,
+) -> np.ndarray:
+    mapped = (lower + upper) * 0.5
+    vals = axis[movable]
+    vals = vals[np.isfinite(vals)]
+    if vals.size >= 2:
+        lo = float(np.quantile(vals, 0.05))
+        hi = float(np.quantile(vals, 0.95))
+        if hi - lo > 1e-12:
+            scaled = np.clip((axis - lo) / (hi - lo), 0.02, 0.98)
+            mapped = lower + scaled * (upper - lower)
+    return mapped
 
 
 def _scale_about_center(
