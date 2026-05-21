@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 import sys
+import hashlib
 from typing import Iterable
 
 import numpy as np
@@ -41,7 +42,7 @@ class ValidityFirstPlacer:
         self.selector_eps = _env_float("OURS_SELECTOR_EPS", 0.001)
 
     def place(self, benchmark: Benchmark) -> torch.Tensor:
-        profile = _benchmark_profile(str(benchmark.name))
+        profile = _adaptive_profile(benchmark)
         if profile:
             return self._place_with_profile(benchmark, profile)
         return self._place_with_current_env(benchmark)
@@ -56,7 +57,9 @@ class ValidityFirstPlacer:
             old_values[key] = None
             os.environ[key] = value
         try:
-            return self._place_with_current_env(benchmark)
+            # Re-read constructor-level knobs such as candidate counts after the
+            # profile environment is active.
+            return ValidityFirstPlacer(gap=self.gap)._place_with_current_env(benchmark)
         finally:
             for key, old_value in old_values.items():
                 if old_value is None:
@@ -319,7 +322,7 @@ class ValidityFirstPlacer:
         return candidates
 
 
-def _benchmark_profile(name: str) -> dict[str, str]:
+def _adaptive_profile(benchmark: Benchmark) -> dict[str, str]:
     if not _env_bool("OURS_AUTO_PROFILE", "1"):
         return {}
 
@@ -345,57 +348,112 @@ def _benchmark_profile(name: str) -> dict[str, str]:
         "OURS_SOFT_SEARCH_BULK": "1",
     }
 
-    profiles: dict[str, dict[str, str]] = {
-        "ibm02": {
-            **high_cong,
-            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "4.00",
-            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "1.00",
-        },
-        "ibm06": {
-            **analytical_heavy,
-            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "8.00",
-            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.50",
-            "OURS_SOFT_SEARCH_SEED": "20261306",
-        },
-        "ibm10": {
-            **analytical_heavy,
-        },
-        "ibm12": {
-            **high_cong,
-            "OURS_SPECTRAL_CANDIDATES": "1",
-            "OURS_FORCE_CANDIDATE": "spectral:xy",
-            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "0.00",
-            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.50",
-        },
-        "ibm14": {
-            **high_cong,
-            "OURS_ANALYTICAL_CONG_WEIGHT": "0.070",
-            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "0.00",
-            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.00",
-            "OURS_SOFT_SEARCH_SEED": "20262114",
-        },
-        "ibm15": {
-            **high_cong,
-            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "0.00",
-            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.50",
-        },
-        "ibm17": {
-            "OURS_SOFT_SEARCH_PORTFOLIO": "0",
-            "OURS_SOFT_SEARCH_BULK": "1",
-            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "8.00",
-            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "1.00",
-            "OURS_SOFT_SEARCH_SEED": "20260530",
-            "OURS_SOFT_SEARCH_TRIALS": "250000",
-            "OURS_SOFT_SEARCH_TIMEOUT": "3300",
-        },
-        "ibm18": {
-            **high_cong,
-            "OURS_SOFT_SEARCH_ROUTE_WEIGHT": "8.00",
-            "OURS_SOFT_SEARCH_DENSITY_WEIGHT": "0.50",
-            "OURS_SOFT_SEARCH_SEED": "20282418",
-        },
+    features = _profile_features(benchmark)
+    hard_density = features["hard_density"]
+    all_density = features["all_density"]
+    movable_hard = features["movable_hard"]
+    soft_count = features["soft_count"]
+    grid_cells = features["grid_cells"]
+    graph_activity = features["macro_graph_activity"]
+    avg_hard_net_degree = features["avg_hard_net_degree"]
+    max_hard_net_degree = features["max_hard_net_degree"]
+
+    large = movable_hard >= 350 or soft_count >= 1200 or grid_cells >= 1600
+    very_large = movable_hard >= 600 or soft_count >= 1800
+    hard_dense = hard_density >= 0.48
+    hard_sparse = hard_density <= 0.25 and movable_hard >= 250
+    graph_rich = graph_activity >= 0.22 and avg_hard_net_degree >= 1.20
+    fanout_heavy = max_hard_net_degree >= 10
+
+    profile: dict[str, str] = {
+        "OURS_SOFT_SEARCH_SEED": str(_feature_seed(benchmark, features)),
+        "OURS_SOFT_SEARCH_BULK": "1",
+        "OURS_SOFT_SEARCH_PORTFOLIO": "0",
+        "OURS_EXACT_SELECT": "1",
+        "OURS_SELECTOR_EPS": "0.006",
     }
-    return profiles.get(name, {})
+
+    if large or hard_dense or hard_sparse:
+        profile.update(analytical_heavy)
+    if hard_dense or hard_sparse or fanout_heavy or grid_cells >= 1800:
+        profile.update(high_cong)
+
+    route_weight = 4.0
+    density_weight = 0.5
+    if hard_sparse:
+        route_weight = 8.0
+        density_weight = 0.5
+    elif hard_dense:
+        route_weight = 6.0
+        density_weight = 1.0
+    elif all_density >= 0.72 and avg_hard_net_degree <= 1.25:
+        route_weight = 0.0
+        density_weight = 0.5
+    elif fanout_heavy:
+        route_weight = 4.0
+        density_weight = 0.5
+    profile["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = f"{route_weight:.2f}"
+    profile["OURS_SOFT_SEARCH_DENSITY_WEIGHT"] = f"{density_weight:.2f}"
+
+    if large and graph_rich:
+        profile["OURS_SPECTRAL_CANDIDATES"] = "1" if very_large else "3"
+        profile["OURS_SELECTOR_EPS"] = "0.012"
+    if very_large or hard_dense or hard_sparse:
+        profile["OURS_LAYOUT_CANDIDATES"] = "3"
+
+    if very_large:
+        profile["OURS_SOFT_SEARCH_TRIALS"] = "160000"
+        profile["OURS_SOFT_SEARCH_TIMEOUT"] = "3300"
+    elif large:
+        profile["OURS_SOFT_SEARCH_TRIALS"] = "120000"
+        profile["OURS_SOFT_SEARCH_TIMEOUT"] = "2800"
+
+    return profile
+
+
+def _profile_features(benchmark: Benchmark) -> dict[str, float]:
+    n_hard = int(benchmark.num_hard_macros)
+    n_all = int(benchmark.num_macros)
+    sizes = benchmark.macro_sizes.detach().cpu().numpy().astype(np.float64, copy=False)
+    fixed = benchmark.macro_fixed[:n_hard].detach().cpu().numpy().astype(bool, copy=False)
+    canvas_area = max(float(benchmark.canvas_width) * float(benchmark.canvas_height), 1e-12)
+    hard_area = float(np.sum(sizes[:n_hard, 0] * sizes[:n_hard, 1])) if n_hard > 0 else 0.0
+    all_area = float(np.sum(sizes[:, 0] * sizes[:, 1])) if n_all > 0 else 0.0
+
+    hard_net_degrees: list[int] = []
+    active_hard: set[int] = set()
+    for nodes_t in benchmark.net_nodes:
+        hard_nodes = {int(raw) for raw in nodes_t.tolist() if 0 <= int(raw) < n_hard}
+        if hard_nodes:
+            hard_net_degrees.append(len(hard_nodes))
+            if len(hard_nodes) > 1:
+                active_hard.update(hard_nodes)
+
+    return {
+        "hard_density": hard_area / canvas_area,
+        "all_density": all_area / canvas_area,
+        "movable_hard": float(max(0, n_hard - int(fixed.sum()))),
+        "soft_count": float(max(0, n_all - n_hard)),
+        "grid_cells": float(int(benchmark.grid_cols) * int(benchmark.grid_rows)),
+        "macro_graph_activity": float(len(active_hard)) / max(float(n_hard), 1.0),
+        "avg_hard_net_degree": float(np.mean(hard_net_degrees)) if hard_net_degrees else 0.0,
+        "max_hard_net_degree": float(max(hard_net_degrees)) if hard_net_degrees else 0.0,
+    }
+
+
+def _feature_seed(benchmark: Benchmark, features: dict[str, float]) -> int:
+    h = hashlib.blake2b(digest_size=8)
+    h.update(str(int(benchmark.num_macros)).encode())
+    h.update(str(int(benchmark.num_hard_macros)).encode())
+    for key in sorted(features):
+        h.update(f"{key}:{features[key]:.6g};".encode())
+    sizes = benchmark.macro_sizes.detach().cpu().numpy().astype(np.float32, copy=False)
+    if sizes.size:
+        sample = sizes[: min(len(sizes), 256)].copy()
+        h.update(sample.tobytes())
+    for nodes_t in benchmark.net_nodes[: min(len(benchmark.net_nodes), 512)]:
+        h.update(str(len(nodes_t)).encode())
+    return 20260000 + (int.from_bytes(h.digest(), "little") % 1000000)
 
 
 def _env(name: str, default: str) -> str:
