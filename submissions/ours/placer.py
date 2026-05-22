@@ -462,8 +462,20 @@ def _adaptive_profile(benchmark: Benchmark) -> dict[str, str]:
     if very_large or hard_dense or hard_sparse:
         profile["OURS_LAYOUT_CANDIDATES"] = "3"
     if large_risk:
-        profile["OURS_EXACT_SEED_SELECT"] = "1"
-        profile["OURS_LAYOUT_CANDIDATES"] = "6"
+        medium_grid = (
+            grid_cells >= 1800
+            and not very_large
+            and not hard_dense
+            and not hard_sparse
+            and movable_hard >= 350
+        )
+        sparse_grid = hard_sparse and not very_large
+        if medium_grid or sparse_grid:
+            profile["OURS_EXACT_SEED_SELECT"] = "1"
+            profile["OURS_LAYOUT_CANDIDATES"] = "6"
+        else:
+            profile["OURS_EXACT_SEED_SELECT"] = "0"
+            profile.setdefault("OURS_LAYOUT_CANDIDATES", "3")
 
     if very_large:
         profile.setdefault("OURS_SOFT_SEARCH_TRIALS", "160000")
