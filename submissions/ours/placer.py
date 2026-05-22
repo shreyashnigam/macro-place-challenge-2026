@@ -88,7 +88,11 @@ class ValidityFirstPlacer:
             if self.optimize and self.steps > 0
             else None
         )
-        selected = _select_by_fast_score(candidates, benchmark, selector_data, eps=self.selector_eps)
+        selected = None
+        if _env_bool("OURS_EXACT_SEED_SELECT", "0") and len(candidates) > 1:
+            selected = _select_by_proxy(candidates, benchmark)
+        if selected is None:
+            selected = _select_by_fast_score(candidates, benchmark, selector_data, eps=self.selector_eps)
         if _env_bool("OURS_PIPELINE_PORTFOLIO", "0") and len(candidates) > 1:
             portfolio = self._try_pipeline_portfolio(
                 candidates,
@@ -366,6 +370,7 @@ def _adaptive_profile(benchmark: Benchmark) -> dict[str, str]:
     large_risk = large and (very_large or hard_dense or hard_sparse or grid_cells >= 1800)
 
     profile: dict[str, str] = {
+        "OURS_EXACT_SEED_SELECT": "0",
         "OURS_SOFT_SEARCH_BULK": "1",
         "OURS_SOFT_SEARCH_PORTFOLIO": "0",
         "OURS_SELECTOR_EPS": "0.006",
@@ -456,6 +461,9 @@ def _adaptive_profile(benchmark: Benchmark) -> dict[str, str]:
         profile["OURS_SELECTOR_EPS"] = "0.012"
     if very_large or hard_dense or hard_sparse:
         profile["OURS_LAYOUT_CANDIDATES"] = "3"
+    if large_risk:
+        profile["OURS_EXACT_SEED_SELECT"] = "1"
+        profile["OURS_LAYOUT_CANDIDATES"] = "6"
 
     if very_large:
         profile.setdefault("OURS_SOFT_SEARCH_TRIALS", "160000")
