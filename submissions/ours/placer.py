@@ -363,6 +363,7 @@ def _adaptive_profile(benchmark: Benchmark) -> dict[str, str]:
     hard_sparse = hard_density <= 0.25 and movable_hard >= 250
     graph_rich = graph_activity >= 0.22 and avg_hard_net_degree >= 1.20
     fanout_heavy = max_hard_net_degree >= 10
+    large_risk = large and (very_large or hard_dense or hard_sparse or grid_cells >= 1800)
 
     profile: dict[str, str] = {
         "OURS_SOFT_SEARCH_BULK": "1",
@@ -411,7 +412,7 @@ def _adaptive_profile(benchmark: Benchmark) -> dict[str, str]:
         profile["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = f"{route_weight:.2f}"
     profile["OURS_SOFT_SEARCH_DENSITY_WEIGHT"] = f"{density_weight:.2f}"
 
-    if _env_bool("OURS_ADAPTIVE_SOFT_PORTFOLIO", "1") and (
+    if _env_bool("OURS_ADAPTIVE_SOFT_PORTFOLIO", "1") and not large_risk and (
         large or hard_dense or hard_sparse or graph_activity <= 0.45
     ):
         route_options = ["auto"]
