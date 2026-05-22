@@ -670,24 +670,46 @@ def _portfolio_candidates(
 ) -> list[tuple[str, str, float, torch.Tensor]]:
     workers = max(1, _env_int("OURS_SOFT_SEARCH_PORTFOLIO_WORKERS", min(14, len(tasks))))
     if workers <= 1 or len(tasks) <= 1:
-        return [
-            (
-                route,
-                mode,
-                density_weight,
-                _run_portfolio_candidate(
-                    baseline,
-                    benchmark,
-                    route,
-                    mode,
-                    density_weight,
-                    seed,
-                    load_plc=load_plc,
-                    is_valid=is_valid,
-                ),
-            )
-            for route, mode, density_weight, seed in tasks
-        ]
+        results: list[tuple[str, str, float, torch.Tensor]] = []
+        timeout = max(0.0, _env_float("OURS_SOFT_SEARCH_PORTFOLIO_TIMEOUT", 3000.0))
+        deadline = time.monotonic() + timeout if timeout > 0.0 else None
+        old_timeout = os.environ.get("OURS_SOFT_SEARCH_TIMEOUT")
+        configured_timeout = _env_float("OURS_SOFT_SEARCH_TIMEOUT", 3200.0)
+        try:
+            for route, mode, density_weight, seed in tasks:
+                if deadline is not None:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 1.0:
+                        _debug(
+                            f"serial portfolio timeout results={len(results)} "
+                            f"tasks={len(tasks)}"
+                        )
+                        break
+                    task_timeout = min(configured_timeout, max(1.0, remaining))
+                    os.environ["OURS_SOFT_SEARCH_TIMEOUT"] = f"{task_timeout:.3f}"
+                results.append(
+                    (
+                        route,
+                        mode,
+                        density_weight,
+                        _run_portfolio_candidate(
+                            baseline,
+                            benchmark,
+                            route,
+                            mode,
+                            density_weight,
+                            seed,
+                            load_plc=load_plc,
+                            is_valid=is_valid,
+                        ),
+                    )
+                )
+        finally:
+            if old_timeout is None:
+                os.environ.pop("OURS_SOFT_SEARCH_TIMEOUT", None)
+            else:
+                os.environ["OURS_SOFT_SEARCH_TIMEOUT"] = old_timeout
+        return results
 
     max_workers = min(workers, len(tasks))
     results: list[tuple[str, str, float, torch.Tensor]] = []

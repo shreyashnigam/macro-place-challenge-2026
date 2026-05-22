@@ -411,6 +411,45 @@ def _adaptive_profile(benchmark: Benchmark) -> dict[str, str]:
         profile["OURS_SOFT_SEARCH_ROUTE_WEIGHT"] = f"{route_weight:.2f}"
     profile["OURS_SOFT_SEARCH_DENSITY_WEIGHT"] = f"{density_weight:.2f}"
 
+    if _env_bool("OURS_ADAPTIVE_SOFT_PORTFOLIO", "1") and (
+        large or hard_dense or hard_sparse or graph_activity <= 0.45
+    ):
+        route_options = ["auto"]
+        if route_weight is not None:
+            route_options.append(f"{route_weight:.2f}")
+        if hard_sparse:
+            route_options.extend(["8.00", "4.00", "0.00"])
+        elif hard_dense:
+            route_options.extend(["4.00", "0.00", "8.00"])
+        elif graph_activity <= 0.45:
+            route_options.extend(["8.00", "4.00"])
+        else:
+            route_options.extend(["0.00", "4.00", "8.00"])
+        profile.update(
+            {
+                "OURS_SOFT_SEARCH_PORTFOLIO": "1",
+                "OURS_SOFT_SEARCH_PORTFOLIO_WORKERS": "1",
+                "OURS_SOFT_SEARCH_PORTFOLIO_DIVERSE_SEEDS": "1",
+                "OURS_SOFT_SEARCH_PORTFOLIO_MODES": "bulk",
+                "OURS_SOFT_SEARCH_PORTFOLIO_ROUTES": ",".join(
+                    _dedupe_strings(route_options)
+                ),
+                "OURS_SOFT_SEARCH_PORTFOLIO_DENSITY_WEIGHTS": ",".join(
+                    _dedupe_strings(
+                        [
+                            f"{density_weight:.2f}",
+                            "0.50",
+                            "1.00" if hard_dense or hard_sparse else "0.00",
+                        ]
+                    )
+                ),
+                "OURS_SOFT_SEARCH_PORTFOLIO_TIMEOUT": (
+                    "1800" if very_large or hard_sparse or hard_dense else "1200"
+                ),
+                "OURS_SOFT_SEARCH_TIMEOUT": "360",
+            }
+        )
+
     if large and graph_rich:
         profile["OURS_SPECTRAL_CANDIDATES"] = "1" if very_large else "3"
         profile["OURS_SELECTOR_EPS"] = "0.012"
@@ -486,6 +525,18 @@ def _append_unique_candidate(
         if torch.allclose(existing, placement, atol=1e-5, rtol=0.0):
             return
     candidates.append((name, placement))
+
+
+def _dedupe_strings(values: Iterable[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        item = str(value).strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        out.append(item)
+    return out
 
 
 def _forced_candidate(candidates: list[tuple[str, torch.Tensor]]) -> torch.Tensor | None:
